@@ -72,6 +72,7 @@ struct SoundBuffer {
   WORD                 BlockAlign;
   long                 play_flag;
   long                 repeat_flag;
+  long                 pause_flag;
 };
 
 // COM終了条件はshutdown+すべてのSoundTestの解放なのでカウントする
@@ -118,6 +119,7 @@ SoundBuffer_release(struct SoundBuffer *st)
     st->BlockAlign  = 0;
     st->play_flag   = 0;
     st->repeat_flag = 0;
+    st->pause_flag  = 0;
 
     // shutduwn+すべてのSoundTestが解放されたらDirectSound解放
     g_refcount--;
@@ -149,17 +151,6 @@ SoundBuffer_memsize(const void *s)
   return sizeof(struct SoundBuffer) + st->buffer_size;
 }
 
-/*
- *
- */
-static struct SoundBuffer *
-get_st(VALUE self)
-{
-  struct SoundBuffer *st = (struct SoundBuffer *)RTYPEDDATA_DATA(self);
-  if (!st->pDSBuffer8) rb_raise(eSoundBufferError, "disposed object");
-  return st;
-}
-
 // SoundTest.newするとまずこれが呼ばれ、次にinitializeが呼ばれる
 static VALUE
 SoundBuffer_allocate(VALUE klass)
@@ -177,7 +168,57 @@ SoundBuffer_allocate(VALUE klass)
   st->BlockAlign  = 0;
   st->play_flag   = 0;
   st->repeat_flag = 0;
+  st->pause_flag  = 0;
   return obj;
+}
+
+/*
+ *
+ */
+static struct SoundBuffer *
+get_st(VALUE self)
+{
+  struct SoundBuffer *st = (struct SoundBuffer *)RTYPEDDATA_DATA(self);
+  if (!st->pDSBuffer8) rb_raise(eSoundBufferError, "disposed object");
+  return st;
+}
+
+static void
+to_raise_an_exception(HRESULT hr)
+{
+  switch (hr) {
+    case CO_E_NOTINITIALIZED:
+      rb_raise(eSoundBufferError, "(CO_E_NOTINITIALIZED)");
+      break;
+    case DSERR_CONTROLUNAVAIL:
+      rb_raise(eSoundBufferError, "(DSERR_CONTROLUNAVAIL)");
+      break;
+    case DSERR_GENERIC:
+      rb_raise(eSoundBufferError, "(DSERR_GENERIC)");
+      break;
+    case DSERR_INVALIDPARAM:
+      rb_raise(eSoundBufferError, "(DSERR_INVALIDPARAM)");
+      break;
+    case DSERR_INVALIDCALL:
+      rb_raise(eSoundBufferError, "(DSERR_INVALIDCALL)");
+      break;
+    case DSERR_NOINTERFACE:
+      rb_raise(eSoundBufferError, "(DSERR_NOINTERFACE)");
+      break;
+    case DSERR_PRIOLEVELNEEDED:
+      rb_raise(eSoundBufferError, "(DSERR_PRIOLEVELNEEDED)");
+      break;
+    case DSERR_BUFFERLOST:
+      /*
+       * LOCALSOFTWAREに置かれたバッファーがロストするか不明
+       * DSERR_BUFFERLOSTエラーを報告するようにしてある。これが発生したら報告してほしい。
+       */
+      rb_raise(eSoundBufferError, "* DSERR_BUFFERLOST *");
+      break;
+    default:
+      if (FAILED(hr)) rb_raise(eSoundBufferError, "DirectSound API error"); // hrのHEX表示をつける
+      break;
+  }
 }
 
 /*
@@ -191,7 +232,7 @@ SoundBuffer_play_pos_eql(VALUE self, VALUE voffset)
   struct SoundBuffer *st = get_st(self);
 
   hr = st->pDSBuffer8->lpVtbl->SetCurrentPosition(st->pDSBuffer8, dwNewPosition);
-  if (FAILED(hr)) rb_raise(eSoundBufferError, "SetCurrentPosition error");
+  if (FAILED(hr)) to_raise_an_exception(hr);
   return UINT2NUM(0);
 }
 
@@ -207,7 +248,7 @@ SoundBuffer_play_pos(VALUE self)
   struct SoundBuffer *st = get_st(self);
 
   hr = st->pDSBuffer8->lpVtbl->GetCurrentPosition(st->pDSBuffer8, &dwCurrentPlayCursor, &dwCurrentWriteCursor);
-  if (FAILED(hr)) rb_raise(eSoundBufferError, "GetCurrentPosition error");
+  if (FAILED(hr)) to_raise_an_exception(hr);
   return UINT2NUM(dwCurrentPlayCursor);
 }
 
@@ -267,11 +308,10 @@ SoundBuffer_to_s(VALUE self)
   struct SoundBuffer *st = get_st(self);
 
   hr = st->pDSBuffer8->lpVtbl->Lock(st->pDSBuffer8, 0, 0, &block1, &blockSize1, &block2, &blockSize2, DSBLOCK_ENTIREBUFFER);
-  if (hr == DSERR_BUFFERLOST) rb_raise(eSoundBufferError, "DSERR_BUFFERLOST error");
-  if (FAILED(hr)) rb_raise(eSoundBufferError, "Lock error");
+  if (FAILED(hr)) to_raise_an_exception(hr);
   str = rb_str_new(block1, blockSize1);
   hr = st->pDSBuffer8->lpVtbl->Unlock(st->pDSBuffer8, block1, blockSize1, block2, blockSize2);
-  if (FAILED(hr)) rb_raise(eSoundBufferError, "Unlock error");
+  if (FAILED(hr)) to_raise_an_exception(hr);
   return str;
 }
 
@@ -285,18 +325,29 @@ SoundBuffer_initialize(int argc, VALUE *argv, VALUE self)
   WAVEFORMATEX pcmwf;
   LPDIRECTSOUNDBUFFER pDSBuffer;
   HRESULT hr;
-  VALUE vbuffer_bytes, vsamples_per_sec, vbits_per_sample, vchannels;
+  VALUE vbuffer, vsamples_per_sec, vbits_per_sample, vchannels;
+  DWORD buffer_bytes;
 
   struct SoundBuffer *st = (struct SoundBuffer *)RTYPEDDATA_DATA(self);
 
-  // 引数の順番は後で検討
-  rb_scan_args(argc, argv, "4", &vbuffer_bytes, &vsamples_per_sec, &vbits_per_sample, &vchannels);
+  rb_scan_args(argc, argv, "4", &vbuffer, &vchannels, &vsamples_per_sec, &vbits_per_sample);
+  switch (TYPE(vbuffer)) {
+  case T_FIXNUM:
+    buffer_bytes = NUM2UINT(vbuffer);
+    break;
+  case T_STRING:
+    buffer_bytes = RSTRING_LEN(vbuffer);
+    break;
+  default:
+    rb_raise(rb_eTypeError, "not valid value");
+    break;
+  }
 
   // フォーマット設定
   pcmwf.wFormatTag      = WAVE_FORMAT_PCM;
-  pcmwf.nChannels       = NUM2INT(vchannels);
-  pcmwf.nSamplesPerSec  = NUM2INT(vsamples_per_sec);
-  pcmwf.wBitsPerSample  = NUM2INT(vbits_per_sample);
+  pcmwf.nChannels       = NUM2UINT(vchannels);
+  pcmwf.nSamplesPerSec  = NUM2UINT(vsamples_per_sec);
+  pcmwf.wBitsPerSample  = NUM2UINT(vbits_per_sample);
   pcmwf.nBlockAlign     = pcmwf.nChannels * pcmwf.wBitsPerSample / 8;
   pcmwf.nAvgBytesPerSec = pcmwf.nSamplesPerSec * pcmwf.nBlockAlign;
   pcmwf.cbSize          = 0;
@@ -305,7 +356,7 @@ SoundBuffer_initialize(int argc, VALUE *argv, VALUE self)
   desc.dwFlags          = DSBCAPS_CTRLFREQUENCY | DSBCAPS_CTRLPAN | DSBCAPS_CTRLVOLUME | DSBCAPS_CTRLFX
                         | DSBCAPS_LOCSOFTWARE | DSBCAPS_CTRLPOSITIONNOTIFY | DSBCAPS_GETCURRENTPOSITION2
                         | DSBCAPS_GLOBALFOCUS;// | DSBCAPS_STICKYFOCUS;
-  desc.dwBufferBytes    = NUM2INT(vbuffer_bytes);
+  desc.dwBufferBytes    = buffer_bytes;
   desc.dwReserved       = 0;
   desc.lpwfxFormat      = &pcmwf;
   desc.guid3DAlgorithm  = DS3DALG_DEFAULT;
@@ -322,8 +373,11 @@ SoundBuffer_initialize(int argc, VALUE *argv, VALUE self)
 
   g_refcount++;
 
+  if (TYPE(vbuffer) == T_STRING) SoundBuffer_write(self, vbuffer);
+
   return self;
 }
+
 /*
  * エフェクトパラメーター反映のためのメソッド
  * エフェクトのパラメーターは再生中に変更しても反映されない。
@@ -345,6 +399,7 @@ SoundBuffer_flash(VALUE self)
   if (FAILED(hr)) rb_raise(eSoundBufferError, "unlock error");
   return self;
 }
+
 /*
  * #play
  */
@@ -355,16 +410,13 @@ SoundBuffer_play(VALUE self)
   struct SoundBuffer *st = get_st(self);
 
   hr = st->pDSBuffer8->lpVtbl->Play(st->pDSBuffer8, 0, 0, 0);
-  /*
-   * LOCALSOFTWAREに置かれたバッファーがロストするか不明
-   * DSERR_BUFFERLOSTエラーを報告するようにしてある。これが発生したら報告してほしい。
-   */
-  if (DSERR_BUFFERLOST == hr) rb_raise(eSoundBufferError, "DSERR_BUFFERLOST error");
-  if (FAILED(hr)) rb_raise(eSoundBufferError, "iDirectSoundBuffer8 Play error");
+  if (FAILED(hr)) to_raise_an_exception(hr);
   st->play_flag   = 1;
   st->repeat_flag = 0;
+  st->pause_flag  = 0;
   return self;
 }
+
 /*
  * #repeat
  */
@@ -375,12 +427,13 @@ SoundBuffer_repeat(VALUE self)
   struct SoundBuffer *st = get_st(self);
 
   hr = st->pDSBuffer8->lpVtbl->Play(st->pDSBuffer8, 0, 0, DSBPLAY_LOOPING);
-  if (DSERR_BUFFERLOST == hr) rb_raise(eSoundBufferError, "DSERR_BUFFERLOST error");
-  if (FAILED(hr)) rb_raise(eSoundBufferError, "iDirectSoundBuffer8 Play error");
+  if (FAILED(hr)) to_raise_an_exception(hr);
   st->play_flag   = 1;
   st->repeat_flag = 1;
+  st->pause_flag  = 0;
   return self;
 }
+
 /*
  * #stop
  */
@@ -392,10 +445,36 @@ SoundBuffer_stop(VALUE self)
 
   hr = st->pDSBuffer8->lpVtbl->Stop(st->pDSBuffer8);
   if (FAILED(hr)) rb_raise(eSoundBufferError, "iDirectSoundBuffer8 Stop error");
+  hr = st->pDSBuffer8->lpVtbl->SetCurrentPosition(st->pDSBuffer8, 0);
+  if (FAILED(hr)) rb_raise(eSoundBufferError, "SetCurrentPosition error");
   st->play_flag   = 0;
   st->repeat_flag = 0;
+  st->pause_flag  = 0;
   return self;
 }
+
+/*
+ * #pause
+*/
+static VALUE
+SoundBuffer_pause(VALUE self)
+{
+  HRESULT hr;
+  struct SoundBuffer *st = get_st(self);
+
+  hr = st->pDSBuffer8->lpVtbl->Stop(st->pDSBuffer8);
+  if (FAILED(hr)) to_raise_an_exception(hr);
+  st->play_flag   = 0;
+  st->pause_flag  = 1;
+  return self;
+}
+
+static VALUE
+SoundBuffer_pausing(VALUE self)
+{
+  return get_st(self)->pause_flag ? Qtrue : Qfalse;
+}
+
 /*
  * #playing?
  */
@@ -417,7 +496,7 @@ SoundBuffer_get_volume(VALUE self)
 
   hr = st->pDSBuffer8->lpVtbl->GetVolume(st->pDSBuffer8, &volume);
   if (hr == DSERR_INVALIDPARAM) rb_raise(eSoundBufferError, "DSERR_INVALIDPARAM error");
-  if (FAILED(hr)) rb_raise(eSoundBufferError, "iDirectSoundBuffer8 GetVolume error");
+  if (FAILED(hr)) to_raise_an_exception(hr);
   return INT2NUM(volume);
 }
 /*
@@ -431,7 +510,7 @@ SoundBuffer_set_volume(VALUE self, VALUE vvolume)
 
   hr = st->pDSBuffer8->lpVtbl->SetVolume(st->pDSBuffer8, NUM2INT(vvolume));
   if (hr == DSERR_INVALIDPARAM) rb_raise(eSoundBufferError, "DSERR_INVALIDPARAM error");
-  if (FAILED(hr)) rb_raise(eSoundBufferError, "iDirectSoundBuffer8 SetVolume error");
+  if (FAILED(hr)) to_raise_an_exception(hr);
   return vvolume;
 }
 /*
@@ -446,7 +525,7 @@ SoundBuffer_get_pan(VALUE self)
 
   hr = st->pDSBuffer8->lpVtbl->GetPan(st->pDSBuffer8, &pan);
   if (hr == DSERR_INVALIDPARAM) rb_raise(eSoundBufferError, "DSERR_INVALIDPARAM error");
-  if (FAILED(hr)) rb_raise(eSoundBufferError, "iDirectSoundBuffer8 GetPan error");
+  if (FAILED(hr)) to_raise_an_exception(hr);
   return INT2NUM(pan);
 }
 /*
@@ -460,7 +539,7 @@ SoundBuffer_set_pan(VALUE self, VALUE vpan)
 
   hr = st->pDSBuffer8->lpVtbl->SetPan(st->pDSBuffer8, NUM2INT(vpan));
   if (hr == DSERR_INVALIDPARAM) rb_raise(eSoundBufferError, "DSERR_INVALIDPARAM error");
-  if (FAILED(hr)) rb_raise(eSoundBufferError, "iDirectSoundBuffer8 SetPan error");
+  if (FAILED(hr)) to_raise_an_exception(hr);
   return vpan;
 }
 /*
@@ -476,7 +555,7 @@ SoundBuffer_get_frequency(VALUE self)
 
   hr = st->pDSBuffer8->lpVtbl->GetFrequency(st->pDSBuffer8, &frequency);
   if (hr == DSERR_INVALIDPARAM) rb_raise(eSoundBufferError, "DSERR_INVALIDPARAM error");
-  if (FAILED(hr)) rb_raise(eSoundBufferError, "iDirectSoundBuffer8 GetFrequency error");
+  if (FAILED(hr)) to_raise_an_exception(hr);
   return UINT2NUM(frequency);
 }
 /*
@@ -490,7 +569,7 @@ SoundBuffer_set_frequency(VALUE self, VALUE vfrequency)
 
   hr = st->pDSBuffer8->lpVtbl->SetFrequency(st->pDSBuffer8, NUM2UINT(vfrequency));
   if (hr == DSERR_INVALIDPARAM) rb_raise(eSoundBufferError, "DSERR_INVALIDPARAM error");
-  if (FAILED(hr)) rb_raise(eSoundBufferError, "iDirectSoundBuffer8 SetFrequency error");
+  if (FAILED(hr)) to_raise_an_exception(hr);
   return vfrequency;
 }
 /*
@@ -568,7 +647,6 @@ SoundBuffer_set_effect(VALUE self, VALUE vargs)
       pDSFXDesc[i].dwReserved2   = 0;
     }
     // エフェクトを設定する。
-    // この時点では過去のエフェクト構造体は開放済み
     // pdwResultCodesは無視する。
     hr = st->pDSBuffer8->lpVtbl->SetFX(st->pDSBuffer8, count, pDSFXDesc, NULL);
     free(pDSFXDesc);
@@ -576,30 +654,12 @@ SoundBuffer_set_effect(VALUE self, VALUE vargs)
   else hr = st->pDSBuffer8->lpVtbl->SetFX(st->pDSBuffer8,  0,      NULL, NULL);
 
   switch (hr) {
-    case CO_E_NOTINITIALIZED:
-      rb_raise(eSoundBufferError, "SetFX error(CO_E_NOTINITIALIZED)");
-      break;
-    case DSERR_CONTROLUNAVAIL:
-      rb_raise(eSoundBufferError, "SetFX error(DSERR_CONTROLUNAVAIL)");
-      break;
-    case DSERR_GENERIC:
-      rb_raise(eSoundBufferError, "SetFX error(DSERR_GENERIC)");
-      break;
-    case DSERR_INVALIDPARAM:
-      rb_raise(eSoundBufferError, "SetFX error(DSERR_INVALIDPARAM)");
-      break;
     case DSERR_INVALIDCALL:
       // 再生中に呼び出したときに出るエラー
       rb_raise(eSoundBufferError, "SetFX error(DSERR_INVALIDCALL)");
       break;
-    case DSERR_NOINTERFACE:
-      rb_raise(eSoundBufferError, "SetFX error(DSERR_NOINTERFACE)");
-      break;
-    case DSERR_PRIOLEVELNEEDED:
-      rb_raise(eSoundBufferError, "SetFX error(DSERR_PRIOLEVELNEEDED)");
-      break;
     default:
-      if (FAILED(hr)) rb_raise(eSoundBufferError, "SetFX error");
+      if (FAILED(hr)) to_raise_an_exception(hr);
       break;
   }
   st->effect_list = rb_obj_freeze(vargs);
@@ -632,11 +692,11 @@ SoundBuffer_SetAllParameters_DSFXGargle(int argc, VALUE *argv, VALUE self)
   DSFXGargle  dsfx;
   struct SoundBuffer *st = get_st(self);
 
+  if (argc != 3) rb_raise(rb_eArgError, "SetAllParameters error(Number of arguments does not match)");
   hr = st->pDSBuffer8->lpVtbl->GetObjectInPath( st->pDSBuffer8,     &GUID_DSFX_STANDARD_GARGLE,
                                                 NUM2UINT(argv[0]),  &IID_IDirectSoundFXGargle8,
                                                 &pObject);
   if (FAILED(hr)) rb_raise(eSoundBufferError, "GetObjectInPath error");
-  if (argc != 3) rb_raise(eSoundBufferError, "SetAllParameters error(Number of arguments does not match)");
   dsfx.dwRateHz    = NUM2UINT(argv[1]);
   dsfx.dwWaveShape = NUM2UINT(argv[2]);
   hr = ((struct IDirectSoundFXGargle8 *)pObject)->lpVtbl->SetAllParameters((struct IDirectSoundFXGargle8 *)pObject, &dsfx);
@@ -675,11 +735,11 @@ SoundBuffer_SetAllParameters_DSFXChorus(int argc, VALUE *argv, VALUE self)
   DSFXChorus  dsfx;
   struct SoundBuffer *st = get_st(self);
 
+  if (argc != 8) rb_raise(rb_eArgError, "SetAllParameters error(Number of arguments does not match)");
   hr = st->pDSBuffer8->lpVtbl->GetObjectInPath( st->pDSBuffer8,     &GUID_DSFX_STANDARD_CHORUS,
                                                 NUM2UINT(argv[0]),  &IID_IDirectSoundFXChorus8,
                                                 &pObject);
   if (FAILED(hr)) rb_raise(eSoundBufferError, "GetObjectInPath error");
-  if (argc != 8) rb_raise(eSoundBufferError, "SetAllParameters error(Number of arguments does not match)");
   dsfx.fWetDryMix = (float)NUM2DBL(argv[1]);
   dsfx.fDepth     = (float)NUM2DBL(argv[2]);
   dsfx.fFeedback  = (float)NUM2DBL(argv[3]);
@@ -723,11 +783,11 @@ SoundBuffer_SetAllParameters_DSFXFlanger(int argc, VALUE *argv, VALUE self)
   DSFXFlanger  dsfx;
   struct SoundBuffer *st = get_st(self);
 
+  if (argc != 8) rb_raise(rb_eArgError, "SetAllParameters error(Number of arguments does not match)");
   hr = st->pDSBuffer8->lpVtbl->GetObjectInPath( st->pDSBuffer8,     &GUID_DSFX_STANDARD_FLANGER,
                                                 NUM2UINT(argv[0]),  &IID_IDirectSoundFXFlanger8,
                                                 &pObject);
   if (FAILED(hr)) rb_raise(eSoundBufferError, "GetObjectInPath error");
-  if (argc != 8) rb_raise(eSoundBufferError, "SetAllParameters error(Number of arguments does not match)");
   dsfx.fWetDryMix = (float)NUM2DBL(argv[1]);
   dsfx.fDepth     = (float)NUM2DBL(argv[2]);
   dsfx.fFeedback  = (float)NUM2DBL(argv[3]);
@@ -769,11 +829,11 @@ SoundBuffer_SetAllParameters_DSFXEcho(int argc, VALUE *argv, VALUE self)
   DSFXEcho  dsfx;
   struct SoundBuffer *st = get_st(self);
 
+  if (argc != 6) rb_raise(rb_eArgError, "SetAllParameters error(Number of arguments does not match)");
   hr = st->pDSBuffer8->lpVtbl->GetObjectInPath( st->pDSBuffer8,     &GUID_DSFX_STANDARD_ECHO,
                                                 NUM2UINT(argv[0]),  &IID_IDirectSoundFXEcho8,
                                                 &pObject);
   if (FAILED(hr)) rb_raise(eSoundBufferError, "GetObjectInPath error");
-  if (argc != 6) rb_raise(eSoundBufferError, "SetAllParameters error(Number of arguments does not match)");
   dsfx.fWetDryMix   = (float)NUM2DBL(argv[1]);
   dsfx.fFeedback    = (float)NUM2DBL(argv[2]);
   dsfx.fLeftDelay   = (float)NUM2DBL(argv[3]);
@@ -813,11 +873,11 @@ SoundBuffer_SetAllParameters_DSFXDistortion(int argc, VALUE *argv, VALUE self)
   DSFXDistortion  dsfx;
   struct SoundBuffer *st = get_st(self);
 
+  if (argc != 6) rb_raise(rb_eArgError, "SetAllParameters error(Number of arguments does not match)");
   hr = st->pDSBuffer8->lpVtbl->GetObjectInPath( st->pDSBuffer8,     &GUID_DSFX_STANDARD_DISTORTION,
                                                 NUM2UINT(argv[0]),  &IID_IDirectSoundFXDistortion8,
                                                 &pObject);
   if (FAILED(hr)) rb_raise(eSoundBufferError, "GetObjectInPath error");
-  if (argc != 6) rb_raise(eSoundBufferError, "SetAllParameters error(Number of arguments does not match)");
   dsfx.fGain                  = (float)NUM2DBL(argv[1]);
   dsfx.fEdge                  = (float)NUM2DBL(argv[2]);
   dsfx.fPostEQCenterFrequency = (float)NUM2DBL(argv[3]);
@@ -858,11 +918,11 @@ SoundBuffer_SetAllParameters_DSFXCompressor(int argc, VALUE *argv, VALUE self)
   DSFXCompressor  dsfx;
   struct SoundBuffer *st = get_st(self);
 
+  if (argc != 7) rb_raise(rb_eArgError, "SetAllParameters error(Number of arguments does not match)");
   hr = st->pDSBuffer8->lpVtbl->GetObjectInPath( st->pDSBuffer8,     &GUID_DSFX_STANDARD_COMPRESSOR,
                                                 NUM2UINT(argv[0]),  &IID_IDirectSoundFXCompressor8,
                                                 &pObject);
   if (FAILED(hr)) rb_raise(eSoundBufferError, "GetObjectInPath error");
-  if (argc != 7) rb_raise(eSoundBufferError, "SetAllParameters error(Number of arguments does not match)");
   dsfx.fGain      = (float)NUM2DBL(argv[1]);
   dsfx.fAttack    = (float)NUM2DBL(argv[2]);
   dsfx.fRelease   = (float)NUM2DBL(argv[3]);
@@ -901,11 +961,11 @@ SoundBuffer_SetAllParameters_DSFXParamEq(int argc, VALUE *argv, VALUE self)
   DSFXParamEq  dsfx;
   struct SoundBuffer *st = get_st(self);
 
+  if (argc != 4) rb_raise(rb_eArgError, "SetAllParameters error(Number of arguments does not match)");
   hr = st->pDSBuffer8->lpVtbl->GetObjectInPath( st->pDSBuffer8,     &GUID_DSFX_STANDARD_PARAMEQ,
                                                 NUM2UINT(argv[0]),  &IID_IDirectSoundFXParamEq8,
                                                 &pObject);
   if (FAILED(hr)) rb_raise(eSoundBufferError, "GetObjectInPath error");
-  if (argc != 4) rb_raise(eSoundBufferError, "SetAllParameters error(Number of arguments does not match)");
   dsfx.fCenter    = (float)NUM2DBL(argv[1]);
   dsfx.fBandwidth = (float)NUM2DBL(argv[2]);
   dsfx.fGain      = (float)NUM2DBL(argv[3]);
@@ -950,11 +1010,11 @@ SoundBuffer_SetAllParameters_DSFXI3DL2Reverb(int argc, VALUE *argv, VALUE self)
   DSFXI3DL2Reverb  dsfx;
   struct SoundBuffer *st = get_st(self);
 
+  if (argc != 13) rb_raise(rb_eArgError, "SetAllParameters error(Number of arguments does not match)");
   hr = st->pDSBuffer8->lpVtbl->GetObjectInPath( st->pDSBuffer8,     &GUID_DSFX_STANDARD_I3DL2REVERB,
                                                 NUM2UINT(argv[0]),  &IID_IDirectSoundFXI3DL2Reverb8,
                                                 &pObject);
   if (FAILED(hr)) rb_raise(eSoundBufferError, "GetObjectInPath error");
-  if (argc != 13) rb_raise(eSoundBufferError, "SetAllParameters error(Number of arguments does not match)");
   dsfx.lRoom               = NUM2INT(argv[1]);
   dsfx.lRoomHF             = NUM2INT(argv[2]);
   dsfx.flRoomRolloffFactor = (float)NUM2DBL(argv[3]);
@@ -1000,11 +1060,11 @@ SoundBuffer_SetAllParameters_DSFXWavesReverb(int argc, VALUE *argv, VALUE self)
   DSFXWavesReverb  dsfx;
   struct SoundBuffer *st = get_st(self);
 
+  if (argc != 5) rb_raise(rb_eArgError, "SetAllParameters error(Number of arguments does not match)");
   hr = st->pDSBuffer8->lpVtbl->GetObjectInPath( st->pDSBuffer8,     &GUID_DSFX_WAVES_REVERB,
                                                 NUM2UINT(argv[0]),  &IID_IDirectSoundFXWavesReverb8,
                                                 &pObject);
   if (FAILED(hr)) rb_raise(eSoundBufferError, "GetObjectInPath error");
-  if (argc != 5) rb_raise(eSoundBufferError, "SetAllParameters error(Number of arguments does not match)");
   dsfx.fInGain          = (float)NUM2DBL(argv[1]);
   dsfx.fReverbMix       = (float)NUM2DBL(argv[2]);
   dsfx.fReverbTime      = (float)NUM2DBL(argv[3]);
@@ -1051,7 +1111,6 @@ SoundBuffer_get_effect_param(VALUE self, VALUE nth)
       return SoundBuffer_GetAllParameters_DSFXWavesReverb(self, nth);
       break;
     default:
-      // 例外を発生させる
       rb_raise(rb_eTypeError, "not valid value");
       break;
   }
@@ -1108,14 +1167,12 @@ SoundBuffer_stop_and_play(VALUE self, VALUE vblock)
   struct SoundBuffer *st = get_st(self);
 
   hr = st->pDSBuffer8->lpVtbl->Stop(st->pDSBuffer8);
-  if (FAILED(hr)) rb_raise(eSoundBufferError, "iDirectSoundBuffer8 Stop error");
-  if (rb_block_given_p()) rb_yield(self);
-  else rb_raise(eSoundBufferError, "not given block error");
+  if (FAILED(hr)) to_raise_an_exception(hr);
 
-  if (st->play_flag) {
-    if (st->repeat_flag) SoundBuffer_repeat(self);
-    else                 SoundBuffer_play(self);
-  }
+  if (rb_block_given_p()) rb_yield(self);
+
+  hr = st->pDSBuffer8->lpVtbl->Play(st->pDSBuffer8, 0, 0, st->repeat_flag ? DSBPLAY_LOOPING : 0);
+  if (FAILED(hr)) to_raise_an_exception(hr);
   return self;
 }
 
@@ -1133,6 +1190,8 @@ Init_SoundBuffer(void)
   rb_define_method(cSoundBuffer, "repeat",           SoundBuffer_repeat,            0);
   rb_define_method(cSoundBuffer, "stop",             SoundBuffer_stop,              0);
   rb_define_method(cSoundBuffer, "write",            SoundBuffer_write,             1);
+  rb_define_method(cSoundBuffer, "pause",            SoundBuffer_pause,             0);
+  rb_define_method(cSoundBuffer, "pausing?",         SoundBuffer_pausing,           0);
   rb_define_method(cSoundBuffer, "play_pos=",        SoundBuffer_play_pos_eql,      1);
   rb_define_method(cSoundBuffer, "play_pos",         SoundBuffer_play_pos,          0);
   rb_define_method(cSoundBuffer, "playing?",         SoundBuffer_playing,           0);
@@ -1152,33 +1211,16 @@ Init_SoundBuffer(void)
   rb_define_method(cSoundBuffer, "set_effect_param", SoundBuffer_set_effect_param, -1);
 
   rb_define_method(cSoundBuffer, "flash",            SoundBuffer_flash,             0);
+
+  rb_define_alias(cSoundBuffer, "volume",     "get_volume");
+  rb_define_alias(cSoundBuffer, "volume=",    "set_volume");
+  rb_define_alias(cSoundBuffer, "pan",        "get_pan");
+  rb_define_alias(cSoundBuffer, "pan=",       "set_pan");
+  rb_define_alias(cSoundBuffer, "frequency",  "get_frequency");
+  rb_define_alias(cSoundBuffer, "frequency=", "set_frequency");
+
   /*
-   * DSFX専用のAccessor
-   * エフェクトパラメーターAccessor、エフェクトの配置番号を必要とする。C側での利用のみとする。
-   */
-  /*
-  rb_define_method(cSoundBuffer, "get_FXGargle",      SoundBuffer_GetAllParameters_DSFXGargle,       1);
-  rb_define_method(cSoundBuffer, "set_FXGargle",      SoundBuffer_SetAllParameters_DSFXGargle,      -1);
-  rb_define_method(cSoundBuffer, "get_FXChorus",      SoundBuffer_GetAllParameters_DSFXChorus,       1);
-  rb_define_method(cSoundBuffer, "set_FXChorus",      SoundBuffer_SetAllParameters_DSFXChorus,      -1);
-  rb_define_method(cSoundBuffer, "get_FXFlanger",     SoundBuffer_GetAllParameters_DSFXFlanger,      1);
-  rb_define_method(cSoundBuffer, "set_FXFlanger",     SoundBuffer_SetAllParameters_DSFXFlanger,     -1);
-  rb_define_method(cSoundBuffer, "get_FXEcho",        SoundBuffer_GetAllParameters_DSFXEcho,         1);
-  rb_define_method(cSoundBuffer, "set_FXEcho",        SoundBuffer_SetAllParameters_DSFXEcho,        -1);
-  rb_define_method(cSoundBuffer, "get_FXDistortion",  SoundBuffer_GetAllParameters_DSFXDistortion,   1);
-  rb_define_method(cSoundBuffer, "set_FXDistortion",  SoundBuffer_SetAllParameters_DSFXDistortion,  -1);
-  rb_define_method(cSoundBuffer, "get_FXCompressor",  SoundBuffer_GetAllParameters_DSFXCompressor,   1);
-  rb_define_method(cSoundBuffer, "set_FXCompressor",  SoundBuffer_SetAllParameters_DSFXCompressor,  -1);
-  rb_define_method(cSoundBuffer, "get_FXParamEq",     SoundBuffer_GetAllParameters_DSFXParamEq,      1);
-  rb_define_method(cSoundBuffer, "set_FXParamEq",     SoundBuffer_SetAllParameters_DSFXParamEq,     -1);
-  rb_define_method(cSoundBuffer, "get_FXI3DL2Reverb", SoundBuffer_GetAllParameters_DSFXI3DL2Reverb,  1);
-  rb_define_method(cSoundBuffer, "set_FXI3DL2Reverb", SoundBuffer_SetAllParameters_DSFXI3DL2Reverb, -1);
-  rb_define_method(cSoundBuffer, "get_FXWavesReverb", SoundBuffer_GetAllParameters_DSFXWavesReverb,  1);
-  rb_define_method(cSoundBuffer, "set_FXWavesReverb", SoundBuffer_SetAllParameters_DSFXWavesReverb, -1);
-  */
-  /*
-   * 定数定義
-   * Effect name consts
+   * Consts
    */
   rb_define_const(cSoundBuffer, "FX_GARGLE",       INT2NUM(FX_GARGLE));
   rb_define_const(cSoundBuffer, "FX_CHORUS",       INT2NUM(FX_CHORUS));
