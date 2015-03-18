@@ -72,7 +72,6 @@ struct SoundBuffer {
   WORD                 BlockAlign;
   long                 play_flag;
   long                 repeat_flag;
-  long                 pause_flag;
 };
 
 // COM終了条件はshutdown+すべてのSoundTestの解放なのでカウントする
@@ -119,7 +118,6 @@ SoundBuffer_release(struct SoundBuffer *st)
     st->BlockAlign  = 0;
     st->play_flag   = 0;
     st->repeat_flag = 0;
-    st->pause_flag  = 0;
 
     // shutduwn+すべてのSoundTestが解放されたらDirectSound解放
     g_refcount--;
@@ -164,11 +162,10 @@ SoundBuffer_allocate(VALUE klass)
   // allocate時点ではバッファサイズが不明なのでバッファは作らない
   st->pDSBuffer8  = NULL;
   st->buffer_size = 0;
-  st->effect_list = Qnil;
+  st->effect_list = rb_obj_freeze(rb_ary_new());
   st->BlockAlign  = 0;
   st->play_flag   = 0;
   st->repeat_flag = 0;
-  st->pause_flag  = 0;
   return obj;
 }
 
@@ -321,49 +318,71 @@ SoundBuffer_size(VALUE self)
 /*
  * call-seq:
  *    sb.write(str) ->  fixnum
+ *    sb.write(str, offset) ->  fixnum
  */
 static VALUE
 SoundBuffer_write(int argc, VALUE *argv, VALUE self)
 {
-  void           *block1;
-  void           *block2;
-  unsigned long   blockSize1;
-  unsigned long   blockSize2;
-  DWORD           offset;
-  DWORD           bytes;
-  char           *strptr;
-  long nolap = 1;
-  long            sync = 0;
-  HRESULT         hr;
-  VALUE           vbuffer, voffset, vopt;
+  LPVOID   ptr1,  ptr2;
+  DWORD    size1, size2;
+  DWORD    offset, bytes, write_size;
+  char    *strptr;
+  HRESULT  hr;
+  VALUE    vbuffer, voffset;
   struct SoundBuffer *st = get_st(self);
 
-  rb_scan_args(argc, argv, "12", &vbuffer, &voffset, &vopt);
+  rb_scan_args(argc, argv, "11", &vbuffer, &voffset);
 
   Check_Type(vbuffer, T_STRING);
   bytes  = RSTRING_LEN(vbuffer);
   strptr = RSTRING_PTR(vbuffer);
   offset = NIL_P(voffset) ? 0 : NUM2UINT(voffset);
-  // opt nilcheck hashcheck
-  //Check_Type(vbuffer, T_HASH);
-  //nolap  = !RTEST(rb_hash_aref(vopt, rb_intern("lap")));
-  //sync   = !RTEST(rb_hash_aref(vopt, rb_intern("sync")));
-
   if (bytes  > st->buffer_size) rb_raise(rb_eRangeError, "string length");
   if (offset > st->buffer_size) rb_raise(rb_eRangeError, "offset");
-  if (nolap && offset + bytes > st->buffer_size) rb_raise(rb_eRangeError, "nolap mode");
-  // Sync or UnSync == WriteCursorLock or FullLock
-  hr = st->pDSBuffer8->lpVtbl->Lock(st->pDSBuffer8, offset, bytes, &block1, &blockSize1, &block2, &blockSize2,
-                                    sync ? DSBLOCK_FROMWRITECURSOR : DSBLOCK_ENTIREBUFFER);
+  if (offset + bytes > st->buffer_size) rb_raise(rb_eRangeError, "this method is nolap mode");
+  hr = st->pDSBuffer8->lpVtbl->Lock(st->pDSBuffer8, offset, 0, &ptr1, &size1, &ptr2, &size2, DSBLOCK_ENTIREBUFFER);
   if (FAILED(hr)) to_raise_an_exception(hr);
 
-  memcpy(block1, strptr, sync ? blockSize1 : bytes); // 全体ロックのときはStrLenを超えてしまう。
-  if (block2 != NULL) memcpy(block2, strptr + blockSize1, blockSize2);
+  write_size = bytes < size1 ? bytes : size1;
+  memcpy(ptr1, strptr, write_size);
 
-  hr = st->pDSBuffer8->lpVtbl->Unlock(st->pDSBuffer8, block1, blockSize1, block2, blockSize2);
-  if (FAILED(hr)) rb_raise(eSoundBufferError, "unlock error");
+  hr = st->pDSBuffer8->lpVtbl->Unlock(st->pDSBuffer8, ptr1, write_size, ptr2, 0);
+  if (FAILED(hr)) rb_raise(eSoundBufferError, "Unlock error");
 
-  return UINT2NUM(blockSize1 + blockSize2);
+  return UINT2NUM(write_size);
+}
+
+static VALUE
+SoundBuffer_write_sync(VALUE self, VALUE vbuffer)
+{
+  LPVOID   ptr1,  ptr2;
+  DWORD    size1, size2;
+  DWORD    bytes, write_size1, write_size2;
+  char    *strptr;
+  HRESULT  hr;
+  struct SoundBuffer *st = get_st(self);
+
+  Check_Type(vbuffer, T_STRING);
+  bytes  = RSTRING_LEN(vbuffer);
+  strptr = RSTRING_PTR(vbuffer);
+
+  if (bytes  > st->buffer_size) rb_raise(rb_eRangeError, "string length");
+  hr = st->pDSBuffer8->lpVtbl->Lock(st->pDSBuffer8, 0, bytes, &ptr1, &size1, &ptr2, &size2, DSBLOCK_FROMWRITECURSOR);
+  if (FAILED(hr)) to_raise_an_exception(hr);
+
+  write_size1 = bytes < size1 ? bytes : size1;
+  memcpy(ptr1, strptr, write_size1);
+  if (ptr2 == NULL) {
+    write_size2 = 0;
+  }
+  else {
+    write_size2 = bytes - write_size1 < size2 ? bytes - write_size1 : size2;
+    memcpy(ptr2, strptr + write_size1, write_size2);
+  }
+  hr = st->pDSBuffer8->lpVtbl->Unlock(st->pDSBuffer8, ptr1, write_size1, ptr2, write_size2);
+  if (FAILED(hr)) rb_raise(eSoundBufferError, "Unlock error");
+
+  return UINT2NUM(write_size1 + write_size2);
 }
 
 /*
@@ -445,7 +464,6 @@ SoundBuffer_initialize(int argc, VALUE *argv, VALUE self)
 
   g_refcount++;
 
-  // Strが与えられなかったときはバッファーの0クリアーを行う。
   if (TYPE(vbuffer) == T_STRING) SoundBuffer_write(1, &vbuffer, self);
 
   return self;
@@ -460,15 +478,13 @@ static VALUE
 SoundBuffer_flash(VALUE self)
 {
   HRESULT hr;
-  LPVOID  ppvAudioPtr1;
-  DWORD   dwAudioBytes1;
-  LPVOID  ppvAudioPtr2;
-  DWORD   dwAudioBytes2;
+  LPVOID  ptr1,  ptr2;
+  DWORD   size1, size2;
   struct SoundBuffer *st = get_st(self);
 
-  hr = st->pDSBuffer8->lpVtbl->Lock(st->pDSBuffer8, 0, 4, &ppvAudioPtr1, &dwAudioBytes1, &ppvAudioPtr2, &dwAudioBytes2, DSBLOCK_FROMWRITECURSOR);
-  if (FAILED(hr)) rb_raise(eSoundBufferError, "lock error");
-  hr = st->pDSBuffer8->lpVtbl->Unlock(st->pDSBuffer8, ppvAudioPtr1, 0, ppvAudioPtr2, 0);
+  hr = st->pDSBuffer8->lpVtbl->Lock(st->pDSBuffer8, 0, 4, &ptr1, &size1, &ptr2, &size2, DSBLOCK_FROMWRITECURSOR);
+  if (FAILED(hr)) to_raise_an_exception(hr);
+  hr = st->pDSBuffer8->lpVtbl->Unlock(st->pDSBuffer8, ptr1, 0, ptr2, 0);
   if (FAILED(hr)) rb_raise(eSoundBufferError, "unlock error");
   return self;
 }
@@ -486,7 +502,6 @@ SoundBuffer_play(VALUE self)
   if (FAILED(hr)) to_raise_an_exception(hr);
   st->play_flag   = 1;
   st->repeat_flag = 0;
-  st->pause_flag  = 0;
   return self;
 }
 
@@ -503,7 +518,6 @@ SoundBuffer_repeat(VALUE self)
   if (FAILED(hr)) to_raise_an_exception(hr);
   st->play_flag   = 1;
   st->repeat_flag = 1;
-  st->pause_flag  = 0;
   return self;
 }
 
@@ -522,7 +536,6 @@ SoundBuffer_stop(VALUE self)
   if (FAILED(hr)) rb_raise(eSoundBufferError, "SetCurrentPosition error");
   st->play_flag   = 0;
   st->repeat_flag = 0;
-  st->pause_flag  = 0;
   return self;
 }
 
@@ -538,14 +551,20 @@ SoundBuffer_pause(VALUE self)
   hr = st->pDSBuffer8->lpVtbl->Stop(st->pDSBuffer8);
   if (FAILED(hr)) to_raise_an_exception(hr);
   st->play_flag   = 0;
-  st->pause_flag  = 1;
   return self;
 }
 
 static VALUE
 SoundBuffer_pausing(VALUE self)
 {
-  return get_st(self)->pause_flag ? Qtrue : Qfalse;
+  HRESULT   hr;
+  DWORD     dwCurrentPlayCursor;
+  DWORD     dwCurrentWriteCursor;
+  struct SoundBuffer *st = get_st(self);
+
+  hr = st->pDSBuffer8->lpVtbl->GetCurrentPosition(st->pDSBuffer8, &dwCurrentPlayCursor, &dwCurrentWriteCursor);
+  if (FAILED(hr)) to_raise_an_exception(hr);
+  return !st->play_flag && dwCurrentPlayCursor > 0 ? Qtrue : Qfalse;
 }
 
 /*
@@ -555,6 +574,12 @@ static VALUE
 SoundBuffer_playing(VALUE self)
 {
   return get_st(self)->play_flag ? Qtrue : Qfalse;
+}
+
+static VALUE
+SoundBuffer_repeating(VALUE self)
+{
+  return get_st(self)->repeat_flag ? Qtrue : Qfalse;
 }
 
 /*
@@ -1245,18 +1270,20 @@ Init_SoundBuffer(void)
 
   rb_define_alloc_func(cSoundBuffer, SoundBuffer_allocate);
   rb_define_private_method(cSoundBuffer, "initialize", SoundBuffer_initialize, -1);
-  rb_define_method(cSoundBuffer, "play",             SoundBuffer_play,              0);
-  rb_define_method(cSoundBuffer, "repeat",           SoundBuffer_repeat,            0);
-  rb_define_method(cSoundBuffer, "stop",             SoundBuffer_stop,              0);
-  rb_define_method(cSoundBuffer, "write",            SoundBuffer_write,            -1);
   rb_define_method(cSoundBuffer, "pause",            SoundBuffer_pause,             0);
   rb_define_method(cSoundBuffer, "pausing?",         SoundBuffer_pausing,           0);
+  rb_define_method(cSoundBuffer, "play",             SoundBuffer_play,              0);
   rb_define_method(cSoundBuffer, "play_pos=",        SoundBuffer_play_pos_eql,      1);
   rb_define_method(cSoundBuffer, "play_pos",         SoundBuffer_play_pos,          0);
   rb_define_method(cSoundBuffer, "playing?",         SoundBuffer_playing,           0);
-  rb_define_method(cSoundBuffer, "to_s",             SoundBuffer_to_s,              0);
+  rb_define_method(cSoundBuffer, "repeat",           SoundBuffer_repeat,            0);
+  rb_define_method(cSoundBuffer, "repeating?",       SoundBuffer_repeating,         0);
   rb_define_method(cSoundBuffer, "size",             SoundBuffer_size,              0);
+  rb_define_method(cSoundBuffer, "stop",             SoundBuffer_stop,              0);
   rb_define_method(cSoundBuffer, "stop_and_play",    SoundBuffer_stop_and_play,     0);
+  rb_define_method(cSoundBuffer, "to_s",             SoundBuffer_to_s,              0);
+  rb_define_method(cSoundBuffer, "write",            SoundBuffer_write,            -1);
+  rb_define_method(cSoundBuffer, "write_sync",       SoundBuffer_write_sync,        1);
 
   rb_define_method(cSoundBuffer, "get_volume",       SoundBuffer_get_volume,        0);
   rb_define_method(cSoundBuffer, "set_volume",       SoundBuffer_set_volume,        1);

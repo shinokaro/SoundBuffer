@@ -6,8 +6,19 @@ zlib/libpng License
 
 ## 求む
 * DSERR_BUFFERLOSTがソフトウェアーバッファーでも起きるのかどうか？　の情報
-* SetNotificationPositionsの使い方。
+* SetNotificationPositionsの使い方。これがわからないと区間ループが実装できない。
 * C拡張からオプション引数の使い方。
+
+## 使い方
+* soundbuffer.so: これ単独でSoundBufferクラスを提供する。
+* soundbuffer.rb: エフェクトを使うときに便利なStructや追加メソッドを提供する。
+
+## 実装インスタンス・メソッド
+play, repeat, pause, stop, playing?, repeating?, pausing?<br />
+size, write, write_sync, stop_and_play<br />
+get_volume, set_volume, get_pan, set_pan, get_frequency, set_frequency<br />
+volume, volume=, pan, pna=, frequency, frequency=<br />
+etc...
 
 ## 今後の予定
 * プライマリー･バッファーへのアクセスメソッド（マスターボリュームのため）
@@ -19,10 +30,11 @@ zlib/libpng License
 * テストコード
 
 ## 現在取り組んでいること
+* play_pos, play_pos= をpos, pos= に改名するかどうか。<< メソッドを追加するかに左右される。
 * to_sメソッドを用意したが、本来iDirectSoundBuffer8からの読み取りは行ってはいけない。
-* writeメソッドでコアダンプがおきる。起きる時と起きないときがある。
-* writeメソッドのオプションをつけるか、つけないか。
-* 書き込みカーソルを使用するかしないか。専用メソッドにするか。
+* プライマリーバッファーへのアクセス。マスターボリュームの実装に必要。
+* Duplicateの実装。同時発音に必要。ただしFXとの併用はできない。
+* BEEP
 
 ## 実装しないもの
 * ハードウェアーバッファーの利用。
