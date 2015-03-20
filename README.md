@@ -12,6 +12,38 @@ zlib/libpng License
 ## 使い方
 * soundbuffer.so: これ単独でSoundBufferクラスを提供する。
 * soundbuffer.rb: エフェクトを使うときに便利なStructや追加メソッドを提供する。
+* beep.rb: Beepモジュール。Beep音を手軽に鳴らすためのモジュール。
+
+上記ファイルのどれかをrequireする。
+### Beepモジュールの例
+```ruby
+require "beep" # エラーが出る場合はパスを通しておくか、相対、絶対パスで指定する
+Beep.beep      # モジュールメソッドを使ったBeep音。1秒間、1kHz、最大音量でなる。
+include Beep   # includeしてモジュール名を省略する。
+sleep 0.1
+beep(1, 1000, 0) # 引数は秒数、周波数、音量。音量は０が最大。小さくしたければマイナスの数値を入れる。
+sleep 0.1
+beep!(4, 1000, 0) # beep!はスレッドでBeepを鳴らすのでブロックしない。
+begin
+  sleep 0.1        # beep音が鳴り止むのを待つループ。少し待たないと鳴り始めない。
+end while beeping? # beeping? はBeep音が鳴っていればtrue。
+beeps(0.2, 1000, 0,
+      0.2, 500, -100) # sec, hz, volの順に鳴らしたい音の数だけ指定する。曲を奏でる。
+sleep 1
+beep_on(1000, 0) # Beep音を鳴らしっぱなしにする。引数は周波数、音量の２つ。
+sleep 0.5
+beep_off         # Beep音を止める。Beep音は1つしか同時に鳴らないので、これで強制的に音を止めることもできる。
+sleep 0.5
+Thread.new {
+  hz = 100
+  while hz < 1000
+    beep_on(hz)
+    sleep 0.01
+    hz += 2
+  end
+  beep_off
+}.join # スレッドからのBeep音。ここではjoinしてスレッドの終了を待っている。
+```
 
 ## 実装インスタンス・メソッド
 play, repeat, pause, stop, playing?, repeating?, pausing?<br />
@@ -34,7 +66,6 @@ etc...
 * to_sメソッドを用意したが、本来iDirectSoundBuffer8からの読み取りは行ってはいけない。
 * プライマリーバッファーへのアクセス。マスターボリュームの実装に必要。
 * Duplicateの実装。同時発音に必要。ただしFXとの併用はできない。
-* BEEP
 
 ## 実装しないもの
 * ハードウェアーバッファーの利用。
