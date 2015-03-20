@@ -3,7 +3,7 @@ require_relative 'soundbuffer.so'
 module Beep
   extend self
 
-  @@beep = SoundBuffer.new(("\xff" * 24 + "\x00" * 24) * 200, 1, 48000, 8)
+  @@beep = SoundBuffer.new(("\xff" * 24 + "\x00" * 24), 1, 48000, 8)
 
   def beep(sec = 1, hz = 1000, vol = 0)
     @@beep.stop_and_play { beep_on(hz, vol) }

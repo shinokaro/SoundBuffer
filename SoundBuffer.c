@@ -73,7 +73,7 @@ struct SoundBuffer {
   WORD                  bits_per_sample;
   WORD                  block_align;
   DWORD                 avg_bytes_per_sec;
-  long                  ctrlfx_flag;
+  DWORD                 ctrlfx_flag;
   VALUE                 effect_list;
   long                  play_flag;
   long                  repeat_flag;
@@ -426,16 +426,12 @@ SoundBuffer_initialize(int argc, VALUE *argv, VALUE self)
   WAVEFORMATEX pcmwf;
   LPDIRECTSOUNDBUFFER pDSBuffer;
   HRESULT hr;
-  VALUE vbuffer, vsamples_per_sec, vbits_per_sample, vchannels, vopt;
-  DWORD buffer_bytes, samples_per_sec;
-  WORD channels, bits_per_sample;
+  VALUE   vbuffer, vsamples_per_sec, vbits_per_sample, vchannels, vopt;
+  DWORD   buffer_bytes, samples_per_sec, ctrlfx;
+  WORD    channels, bits_per_sample;
   struct SoundBuffer *st = (struct SoundBuffer *)RTYPEDDATA_DATA(self);
 
   rb_scan_args(argc, argv, "13:", &vbuffer, &vchannels, &vsamples_per_sec, &vbits_per_sample, &vopt);
-  channels        = NIL_P(vchannels)        ? 1     : NUM2UINT(vchannels);
-  samples_per_sec = NIL_P(vsamples_per_sec) ? 48000 : NUM2UINT(vsamples_per_sec);
-  bits_per_sample = NIL_P(vbits_per_sample) ? 16    : NUM2UINT(vbits_per_sample);
-
   switch (TYPE(vbuffer)) {
   case T_FIXNUM:
     buffer_bytes = NUM2UINT(vbuffer);
@@ -447,6 +443,20 @@ SoundBuffer_initialize(int argc, VALUE *argv, VALUE self)
     rb_raise(rb_eTypeError, "not valid value");
     break;
   }
+  if (buffer_bytes < DSBSIZE_MIN || DSBSIZE_MAX < buffer_bytes) rb_raise(rb_eRangeError, "buffer_size error");
+  channels        = NIL_P(vchannels)        ? 1     : (WORD)NUM2UINT(vchannels);
+  if (channels != 1 && channels != 2) rb_raise(rb_eRangeError, "channels arguments 1 and 2 only possible");
+  samples_per_sec = NIL_P(vsamples_per_sec) ? 48000 : NUM2UINT(vsamples_per_sec);
+  if (samples_per_sec < DSBFREQUENCY_MIN || DSBFREQUENCY_MAX < samples_per_sec) rb_raise(rb_eRangeError, "samples_per_sec argument can be only DSBFREQUENCY_MIN-DSBFREQUENCY_MAX");
+  bits_per_sample = NIL_P(vbits_per_sample) ? 16    : (WORD)NUM2UINT(vbits_per_sample);
+  if (bits_per_sample != 8 && bits_per_sample != 16) rb_raise(rb_eRangeError, "bits_per_sample arguments 8 and 16 only possible");
+  // rb_raise(rb_eRangeError, "STOP!");
+  //ctrlfx = (bits_per_sample == 16) && RTEST(rb_hash_lookup(vopt, ID2SYM(rb_intern("effect")))) ? DSBCAPS_CTRLFX : 0;
+  // ctrlfx = rb_hash_lookup(vopt, ID2SYM(rb_intern("effect"))); core dump????
+  ctrlfx = (bits_per_sample == 16) ? DSBCAPS_CTRLFX : 0;
+  // FX時のDSBSIZE_FX_MIN　(msec)ちぇｃｋ
+  // if (buffer_bytes < sample_per_sec / 1000 * DSBSIZE_FX_MIN) rb_raise();
+
 
   // フォーマット設定
   pcmwf.wFormatTag      = WAVE_FORMAT_PCM;
@@ -458,7 +468,7 @@ SoundBuffer_initialize(int argc, VALUE *argv, VALUE self)
   pcmwf.cbSize          = 0;
   // DirectSoundバッファ設定
   desc.dwSize           = sizeof(desc);
-  desc.dwFlags          = DSBCAPS_CTRLFREQUENCY | DSBCAPS_CTRLPAN | DSBCAPS_CTRLVOLUME | DSBCAPS_CTRLFX
+  desc.dwFlags          = DSBCAPS_CTRLFREQUENCY | DSBCAPS_CTRLPAN | DSBCAPS_CTRLVOLUME | ctrlfx
                         | DSBCAPS_LOCSOFTWARE | DSBCAPS_CTRLPOSITIONNOTIFY | DSBCAPS_GETCURRENTPOSITION2
                         | DSBCAPS_GLOBALFOCUS;// | DSBCAPS_STICKYFOCUS;
   desc.dwBufferBytes    = buffer_bytes;
@@ -479,7 +489,7 @@ SoundBuffer_initialize(int argc, VALUE *argv, VALUE self)
   st->bits_per_sample   = pcmwf.wBitsPerSample;
   st->block_align       = pcmwf.nBlockAlign;
   st->avg_bytes_per_sec = pcmwf.nAvgBytesPerSec;
-  st->ctrlfx_flag       = 1; /////////////////////////
+  st->ctrlfx_flag       = ctrlfx ? 1 : 0;
   g_refcount++;
 
   if (TYPE(vbuffer) == T_STRING) SoundBuffer_write(1, &vbuffer, self);
@@ -716,6 +726,7 @@ static VALUE
 SoundBuffer_get_effect(VALUE self)
 {
   struct SoundBuffer *st = get_st(self);
+  if (!st->ctrlfx_flag) rb_raise(rb_eNotImpError, "this object is not effect support");
   return st->effect_list;
 }
 /*
@@ -732,6 +743,7 @@ SoundBuffer_set_effect(VALUE self, VALUE vargs)
   LPDSEFFECTDESC    pDSFXDesc;
   struct SoundBuffer *st = get_st(self);
 
+  if (!st->ctrlfx_flag) rb_raise(rb_eNotImpError, "this object is not effect support");
   Check_Type(vargs, T_ARRAY);
 
   // エフェクトリストのサイズ取得
@@ -1208,6 +1220,7 @@ SoundBuffer_get_effect_param(VALUE self, VALUE nth)
 {
   struct SoundBuffer *st = get_st(self);
 
+  if (!st->ctrlfx_flag) rb_raise(rb_eNotImpError, "this object is not effect support");
   switch (NUM2UINT(rb_ary_entry(st->effect_list, NUM2UINT(nth)))) {
     case FX_GARGLE:
       return SoundBuffer_GetAllParameters_DSFXGargle(self, nth);
@@ -1249,6 +1262,7 @@ SoundBuffer_set_effect_param(int argc, VALUE *argv, VALUE self)
 {
   struct SoundBuffer *st = get_st(self);
 
+  if (!st->ctrlfx_flag) rb_raise(rb_eNotImpError, "this object is not effect support");
   switch (NUM2UINT(rb_ary_entry(st->effect_list, NUM2UINT(argv[0])))) {
     case FX_GARGLE:
       return SoundBuffer_SetAllParameters_DSFXGargle(argc, argv, self);
