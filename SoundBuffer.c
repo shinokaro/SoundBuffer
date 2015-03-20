@@ -435,7 +435,7 @@ SoundBuffer_initialize(int argc, VALUE *argv, VALUE self)
   channels        = NIL_P(vchannels)        ? 1     : NUM2UINT(vchannels);
   samples_per_sec = NIL_P(vsamples_per_sec) ? 48000 : NUM2UINT(vsamples_per_sec);
   bits_per_sample = NIL_P(vbits_per_sample) ? 16    : NUM2UINT(vbits_per_sample);
-  
+
   switch (TYPE(vbuffer)) {
   case T_FIXNUM:
     buffer_bytes = NUM2UINT(vbuffer);
@@ -487,6 +487,30 @@ SoundBuffer_initialize(int argc, VALUE *argv, VALUE self)
   return self;
 }
 
+/*
+ *
+ */
+static VALUE
+SoundBuffer_get_channels(VALUE self)
+{
+  return UINT2NUM((DWORD)(get_st(self)->channels));
+}
+/*
+ *
+ */
+static VALUE
+SoundBuffer_get_samples_per_sec(VALUE self)
+{
+  return UINT2NUM(get_st(self)->samples_per_sec);
+}
+/*
+ *
+ */
+static VALUE
+SoundBuffer_get_bits_per_sample(VALUE self)
+{
+  return UINT2NUM((DWORD)(get_st(self)->bits_per_sample));
+}
 /*
  * エフェクトパラメーター反映のためのメソッド
  * エフェクトのパラメーターは再生中に変更しても反映されない。
@@ -1302,6 +1326,10 @@ Init_SoundBuffer(void)
   rb_define_method(cSoundBuffer, "to_s",             SoundBuffer_to_s,              0);
   rb_define_method(cSoundBuffer, "write",            SoundBuffer_write,            -1);
   rb_define_method(cSoundBuffer, "write_sync",       SoundBuffer_write_sync,        1);
+
+  rb_define_method(cSoundBuffer, "get_channels",        SoundBuffer_get_channels,        0);
+  rb_define_method(cSoundBuffer, "get_samples_per_sec", SoundBuffer_get_samples_per_sec, 0);
+  rb_define_method(cSoundBuffer, "get_bits_per_sample", SoundBuffer_get_bits_per_sample, 0);
 
   rb_define_method(cSoundBuffer, "get_volume",       SoundBuffer_get_volume,        0);
   rb_define_method(cSoundBuffer, "set_volume",       SoundBuffer_set_volume,        1);
