@@ -66,12 +66,17 @@ static LPDIRECTSOUND8 g_pDSound;
 
 // RubyのSoundTestオブジェクトが持つC構造体
 struct SoundBuffer {
-  LPDIRECTSOUNDBUFFER8 pDSBuffer8;
-  size_t               buffer_size;
-  VALUE                effect_list;
-  WORD                 BlockAlign;
-  long                 play_flag;
-  long                 repeat_flag;
+  LPDIRECTSOUNDBUFFER8  pDSBuffer8;
+  size_t                buffer_size;
+  WORD                  channels;
+  DWORD                 samples_per_sec;
+  WORD                  bits_per_sample;
+  WORD                  block_align;
+  DWORD                 avg_bytes_per_sec;
+  long                  ctrlfx_flag;
+  VALUE                 effect_list;
+  long                  play_flag;
+  long                  repeat_flag;
 };
 
 // COM終了条件はshutdown+すべてのSoundTestの解放なのでカウントする
@@ -115,9 +120,6 @@ SoundBuffer_release(struct SoundBuffer *st)
     st->pDSBuffer8  = NULL;
     st->buffer_size = 0;
     st->effect_list = Qnil;
-    st->BlockAlign  = 0;
-    st->play_flag   = 0;
-    st->repeat_flag = 0;
 
     // shutduwn+すべてのSoundTestが解放されたらDirectSound解放
     g_refcount--;
@@ -160,12 +162,17 @@ SoundBuffer_allocate(VALUE klass)
   obj = TypedData_Make_Struct(klass, struct SoundBuffer, &SoundBuffer_data_type, st);
 
   // allocate時点ではバッファサイズが不明なのでバッファは作らない
-  st->pDSBuffer8  = NULL;
-  st->buffer_size = 0;
-  st->effect_list = rb_obj_freeze(rb_ary_new());
-  st->BlockAlign  = 0;
-  st->play_flag   = 0;
-  st->repeat_flag = 0;
+  st->pDSBuffer8        = NULL;
+  st->buffer_size       = 0;
+  st->channels          = 0;
+  st->samples_per_sec   = 0;
+  st->bits_per_sample   = 0;
+  st->block_align       = 0;
+  st->avg_bytes_per_sec = 0;
+  st->ctrlfx_flag       = 0;
+  st->effect_list       = rb_obj_freeze(rb_ary_new());
+  st->play_flag         = 0;
+  st->repeat_flag       = 0;
   return obj;
 }
 
@@ -325,7 +332,7 @@ SoundBuffer_write(int argc, VALUE *argv, VALUE self)
 {
   LPVOID   ptr1,  ptr2;
   DWORD    size1, size2;
-  DWORD    offset, bytes, write_size;
+  DWORD    bytes, offset, write_size;
   char    *strptr;
   HRESULT  hr;
   VALUE    vbuffer, voffset;
@@ -337,8 +344,9 @@ SoundBuffer_write(int argc, VALUE *argv, VALUE self)
   bytes  = RSTRING_LEN(vbuffer);
   strptr = RSTRING_PTR(vbuffer);
   offset = NIL_P(voffset) ? 0 : NUM2UINT(voffset);
-  if (bytes  > st->buffer_size) rb_raise(rb_eRangeError, "string length");
-  if (offset > st->buffer_size) rb_raise(rb_eRangeError, "offset");
+  if (bytes  > st->buffer_size)         rb_raise(rb_eRangeError, "string length");
+  if (offset > st->buffer_size)         rb_raise(rb_eRangeError, "offset");
+  //if (offset < 0)                       rb_raise(rb_eRangeError, "negative offset");
   if (offset + bytes > st->buffer_size) rb_raise(rb_eRangeError, "this method is nolap mode");
   hr = st->pDSBuffer8->lpVtbl->Lock(st->pDSBuffer8, offset, 0, &ptr1, &size1, &ptr2, &size2, DSBLOCK_ENTIREBUFFER);
   if (FAILED(hr)) to_raise_an_exception(hr);
@@ -391,18 +399,19 @@ SoundBuffer_write_sync(VALUE self, VALUE vbuffer)
 static VALUE
 SoundBuffer_to_s(VALUE self)
 {
-  void           *block1;
-  void           *block2;
-  unsigned long   blockSize1;
-  unsigned long   blockSize2;
-  HRESULT         hr;
-  VALUE           str;
+  LPVOID   ptr1,  ptr2;
+  DWORD    size1, size2;
+  HRESULT  hr;
+  VALUE    str;
   struct SoundBuffer *st = get_st(self);
 
-  hr = st->pDSBuffer8->lpVtbl->Lock(st->pDSBuffer8, 0, 0, &block1, &blockSize1, &block2, &blockSize2, DSBLOCK_ENTIREBUFFER);
+// 再生中にto_sできるようにするか？
+  if (st->play_flag) rb_raise(eSoundBufferError, "now playing, plz stop");
+  hr = st->pDSBuffer8->lpVtbl->Lock(st->pDSBuffer8, 0, 0, &ptr1, &size1, &ptr2, &size2, DSBLOCK_ENTIREBUFFER);
   if (FAILED(hr)) to_raise_an_exception(hr);
-  str = rb_str_new(block1, blockSize1);
-  hr = st->pDSBuffer8->lpVtbl->Unlock(st->pDSBuffer8, block1, blockSize1, block2, blockSize2);
+  if (size1 != st->buffer_size) rb_raise(eSoundBufferError, "can not full lock");
+  str = rb_str_new(ptr1, size1);
+  hr = st->pDSBuffer8->lpVtbl->Unlock(st->pDSBuffer8, ptr1, 0, ptr2, 0);
   if (FAILED(hr)) to_raise_an_exception(hr);
   return str;
 }
@@ -417,11 +426,16 @@ SoundBuffer_initialize(int argc, VALUE *argv, VALUE self)
   WAVEFORMATEX pcmwf;
   LPDIRECTSOUNDBUFFER pDSBuffer;
   HRESULT hr;
-  VALUE vbuffer, vsamples_per_sec, vbits_per_sample, vchannels;
-  DWORD buffer_bytes;
+  VALUE vbuffer, vsamples_per_sec, vbits_per_sample, vchannels, vopt;
+  DWORD buffer_bytes, samples_per_sec;
+  WORD channels, bits_per_sample;
   struct SoundBuffer *st = (struct SoundBuffer *)RTYPEDDATA_DATA(self);
 
-  rb_scan_args(argc, argv, "4", &vbuffer, &vchannels, &vsamples_per_sec, &vbits_per_sample);
+  rb_scan_args(argc, argv, "13:", &vbuffer, &vchannels, &vsamples_per_sec, &vbits_per_sample, &vopt);
+  channels        = NIL_P(vchannels)        ? 1     : NUM2UINT(vchannels);
+  samples_per_sec = NIL_P(vsamples_per_sec) ? 48000 : NUM2UINT(vsamples_per_sec);
+  bits_per_sample = NIL_P(vbits_per_sample) ? 16    : NUM2UINT(vbits_per_sample);
+  
   switch (TYPE(vbuffer)) {
   case T_FIXNUM:
     buffer_bytes = NUM2UINT(vbuffer);
@@ -436,9 +450,9 @@ SoundBuffer_initialize(int argc, VALUE *argv, VALUE self)
 
   // フォーマット設定
   pcmwf.wFormatTag      = WAVE_FORMAT_PCM;
-  pcmwf.nChannels       = NUM2UINT(vchannels);
-  pcmwf.nSamplesPerSec  = NUM2UINT(vsamples_per_sec);
-  pcmwf.wBitsPerSample  = NUM2UINT(vbits_per_sample);
+  pcmwf.nChannels       = channels;
+  pcmwf.nSamplesPerSec  = samples_per_sec;
+  pcmwf.wBitsPerSample  = bits_per_sample;
   pcmwf.nBlockAlign     = pcmwf.nChannels * pcmwf.wBitsPerSample / 8;
   pcmwf.nAvgBytesPerSec = pcmwf.nSamplesPerSec * pcmwf.nBlockAlign;
   pcmwf.cbSize          = 0;
@@ -459,9 +473,13 @@ SoundBuffer_initialize(int argc, VALUE *argv, VALUE self)
   if (FAILED(hr)) rb_raise(eSoundBufferError, "query interface error");
   pDSBuffer->lpVtbl->Release(pDSBuffer);
 
-  st->buffer_size = desc.dwBufferBytes;
-  st->BlockAlign  = pcmwf.nBlockAlign;
-
+  st->buffer_size       = desc.dwBufferBytes;
+  st->channels          = pcmwf.nChannels;
+  st->samples_per_sec   = pcmwf.nSamplesPerSec;
+  st->bits_per_sample   = pcmwf.wBitsPerSample;
+  st->block_align       = pcmwf.nBlockAlign;
+  st->avg_bytes_per_sec = pcmwf.nAvgBytesPerSec;
+  st->ctrlfx_flag       = 1; /////////////////////////
   g_refcount++;
 
   if (TYPE(vbuffer) == T_STRING) SoundBuffer_write(1, &vbuffer, self);
