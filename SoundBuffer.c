@@ -86,7 +86,6 @@ static int g_refcount = 0;
 static void   SoundBuffer_mark(void *s);
 static void   SoundBuffer_free(void *s);
 static size_t SoundBuffer_memsize(const void *s);
-static VALUE  SoundBuffer_stop(VALUE self);
 
 // TypedData用の型データ
 const rb_data_type_t SoundBuffer_data_type = {
@@ -489,6 +488,23 @@ SoundBuffer_initialize(int argc, VALUE *argv, VALUE self)
   if (TYPE(vbuffer) == T_STRING) SoundBuffer_write(1, &vbuffer, self);
 
   return self;
+}
+
+/*
+ *
+ */
+static VALUE
+SoundBuffer_dispose(VALUE self)
+{
+  SoundBuffer_release(get_st(self));
+  return self;
+}
+
+static VALUE
+SoundBuffer_disposed(VALUE self)
+{
+  struct SoundBuffer *st = (struct SoundBuffer *)RTYPEDDATA_DATA(self);
+  return st->pDSBuffer8 ? Qfalse : Qtrue;
 }
 
 /*
@@ -1348,8 +1364,11 @@ Init_SoundBuffer(void)
   rb_define_method(cSoundBuffer, "to_s",             SoundBuffer_to_s,              0);
   rb_define_method(cSoundBuffer, "write",            SoundBuffer_write,            -1);
   rb_define_method(cSoundBuffer, "write_sync",       SoundBuffer_write_sync,        1);
-  rb_define_method(cSoundBuffer, "effectable?",       SoundBuffer_get_effectable,   0);
-  
+  rb_define_method(cSoundBuffer, "effectable?",      SoundBuffer_get_effectable,    0);
+
+  rb_define_method(cSoundBuffer, "dispose",          SoundBuffer_dispose,           0);
+  rb_define_method(cSoundBuffer, "disposed?",        SoundBuffer_disposed,          0);
+
   rb_define_method(cSoundBuffer, "channels",          SoundBuffer_get_channels,          0);
   rb_define_method(cSoundBuffer, "samples_per_sec",   SoundBuffer_get_samples_per_sec,   0);
   rb_define_method(cSoundBuffer, "bits_per_sample",   SoundBuffer_get_bits_per_sample,   0);
