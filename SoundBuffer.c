@@ -462,9 +462,9 @@ SoundBuffer_initialize(int argc, VALUE *argv, VALUE self)
   pcmwf.wFormatTag      = WAVE_FORMAT_PCM;
   pcmwf.nChannels       = st->channels;
   pcmwf.nSamplesPerSec  = st->samples_per_sec;
-  pcmwf.wBitsPerSample  = st->bits_per_sample;
-  pcmwf.nBlockAlign     = st->block_align;
   pcmwf.nAvgBytesPerSec = st->avg_bytes_per_sec;
+  pcmwf.nBlockAlign     = st->block_align;
+  pcmwf.wBitsPerSample  = st->bits_per_sample;
   pcmwf.cbSize          = 0;
   // DirectSoundバッファ設定
   desc.dwSize           = sizeof(desc);
@@ -499,21 +499,35 @@ SoundBuffer_get_channels(VALUE self)
 {
   return UINT2NUM((DWORD)(get_st(self)->channels));
 }
-/*
- *
- */
+
 static VALUE
 SoundBuffer_get_samples_per_sec(VALUE self)
 {
   return UINT2NUM(get_st(self)->samples_per_sec);
 }
-/*
- *
- */
+
 static VALUE
 SoundBuffer_get_bits_per_sample(VALUE self)
 {
   return UINT2NUM((DWORD)(get_st(self)->bits_per_sample));
+}
+
+static VALUE
+SoundBuffer_get_block_align(VALUE self)
+{
+  return UINT2NUM((DWORD)(get_st(self)->block_align));
+}
+
+static VALUE
+SoundBuffer_get_avg_bytes_per_sec(VALUE self)
+{
+  return UINT2NUM(get_st(self)->avg_bytes_per_sec);
+}
+
+static VALUE
+SoundBuffer_get_effectable(VALUE self)
+{
+  return get_st(self)->ctrlfx_flag ? Qtrue : Qfalse;
 }
 /*
  * エフェクトパラメーター反映のためのメソッド
@@ -1334,10 +1348,13 @@ Init_SoundBuffer(void)
   rb_define_method(cSoundBuffer, "to_s",             SoundBuffer_to_s,              0);
   rb_define_method(cSoundBuffer, "write",            SoundBuffer_write,            -1);
   rb_define_method(cSoundBuffer, "write_sync",       SoundBuffer_write_sync,        1);
-
-  rb_define_method(cSoundBuffer, "get_channels",        SoundBuffer_get_channels,        0);
-  rb_define_method(cSoundBuffer, "get_samples_per_sec", SoundBuffer_get_samples_per_sec, 0);
-  rb_define_method(cSoundBuffer, "get_bits_per_sample", SoundBuffer_get_bits_per_sample, 0);
+  rb_define_method(cSoundBuffer, "effectable?",       SoundBuffer_get_effectable,   0);
+  
+  rb_define_method(cSoundBuffer, "channels",          SoundBuffer_get_channels,          0);
+  rb_define_method(cSoundBuffer, "samples_per_sec",   SoundBuffer_get_samples_per_sec,   0);
+  rb_define_method(cSoundBuffer, "bits_per_sample",   SoundBuffer_get_bits_per_sample,   0);
+  rb_define_method(cSoundBuffer, "block_align",       SoundBuffer_get_block_align,       0);
+  rb_define_method(cSoundBuffer, "avg_bytes_per_sec", SoundBuffer_get_avg_bytes_per_sec, 0);
 
   rb_define_method(cSoundBuffer, "get_volume",       SoundBuffer_get_volume,        0);
   rb_define_method(cSoundBuffer, "set_volume",       SoundBuffer_set_volume,        1);
