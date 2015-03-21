@@ -147,6 +147,7 @@ SoundBuffer_memsize(const void *s)
 
   // ざっくりstruct SoundBufferとバッファのサイズを足して返す
   return sizeof(struct SoundBuffer) + st->buffer_bytes;
+  // Dup対応のため、クラス側にメモリーリストを導入する。
 }
 
 // SoundTest.newするとまずこれが呼ばれ、次にinitializeが呼ばれる
@@ -408,7 +409,7 @@ SoundBuffer_to_s(VALUE self)
   hr = st->pDSBuffer8->lpVtbl->Lock(st->pDSBuffer8, 0, 0, &ptr1, &size1, &ptr2, &size2, DSBLOCK_ENTIREBUFFER);
   if (FAILED(hr)) to_raise_an_exception(hr);
   if (size1 != st->buffer_bytes) rb_raise(eSoundBufferError, "can not full lock");
-  str = rb_str_new(ptr1, size1);
+  str = rb_str_new(ptr1, size1); // RB_GC_GUARD必要？
   hr = st->pDSBuffer8->lpVtbl->Unlock(st->pDSBuffer8, ptr1, 0, ptr2, 0);
   if (FAILED(hr)) to_raise_an_exception(hr);
   return str;
@@ -488,6 +489,28 @@ SoundBuffer_initialize(int argc, VALUE *argv, VALUE self)
   if (TYPE(vbuffer) == T_STRING) SoundBuffer_write(1, &vbuffer, self);
 
   return self;
+}
+
+/*
+ *
+ */
+static VALUE
+SoundBuffer_duplicate(VALUE self)
+{
+  HRESULT hr;
+  VALUE   obj;
+  struct SoundBuffer *src, *dst;
+
+  src = get_st(self);
+  obj = SoundBuffer_allocate(cSoundBuffer);
+  dst = (struct SoundBuffer *)RTYPEDDATA_DATA(obj);
+
+  hr = g_pDSound->lpVtbl->DuplicateSoundBuffer(g_pDSound, (LPDIRECTSOUNDBUFFER)src->pDSBuffer8, (LPDIRECTSOUNDBUFFER *)&dst->pDSBuffer8);
+  if (FAILED(hr)) to_raise_an_exception(hr);
+
+  dst = src;
+  g_refcount++;
+  return obj;
 }
 
 /*
@@ -1350,24 +1373,27 @@ Init_SoundBuffer(void)
 
   rb_define_alloc_func(cSoundBuffer, SoundBuffer_allocate);
   rb_define_private_method(cSoundBuffer, "initialize", SoundBuffer_initialize, -1);
-  rb_define_method(cSoundBuffer, "pause",            SoundBuffer_pause,             0);
-  rb_define_method(cSoundBuffer, "pausing?",         SoundBuffer_pausing,           0);
-  rb_define_method(cSoundBuffer, "play",             SoundBuffer_play,              0);
-  rb_define_method(cSoundBuffer, "play_pos=",        SoundBuffer_play_pos_eql,      1);
-  rb_define_method(cSoundBuffer, "play_pos",         SoundBuffer_play_pos,          0);
-  rb_define_method(cSoundBuffer, "playing?",         SoundBuffer_playing,           0);
-  rb_define_method(cSoundBuffer, "repeat",           SoundBuffer_repeat,            0);
-  rb_define_method(cSoundBuffer, "repeating?",       SoundBuffer_repeating,         0);
-  rb_define_method(cSoundBuffer, "size",             SoundBuffer_size,              0);
-  rb_define_method(cSoundBuffer, "stop",             SoundBuffer_stop,              0);
-  rb_define_method(cSoundBuffer, "stop_and_play",    SoundBuffer_stop_and_play,     0);
-  rb_define_method(cSoundBuffer, "to_s",             SoundBuffer_to_s,              0);
-  rb_define_method(cSoundBuffer, "write",            SoundBuffer_write,            -1);
-  rb_define_method(cSoundBuffer, "write_sync",       SoundBuffer_write_sync,        1);
-  rb_define_method(cSoundBuffer, "effectable?",      SoundBuffer_get_effectable,    0);
 
-  rb_define_method(cSoundBuffer, "dispose",          SoundBuffer_dispose,           0);
-  rb_define_method(cSoundBuffer, "disposed?",        SoundBuffer_disposed,          0);
+  rb_define_method(cSoundBuffer, "duplicate",         SoundBuffer_duplicate,         0);
+
+  rb_define_method(cSoundBuffer, "dispose",           SoundBuffer_dispose,           0);
+  rb_define_method(cSoundBuffer, "disposed?",         SoundBuffer_disposed,          0);
+  rb_define_method(cSoundBuffer, "flash",             SoundBuffer_flash,             0);
+  rb_define_method(cSoundBuffer, "pause",             SoundBuffer_pause,             0);
+  rb_define_method(cSoundBuffer, "pausing?",          SoundBuffer_pausing,           0);
+  rb_define_method(cSoundBuffer, "play",              SoundBuffer_play,              0);
+  rb_define_method(cSoundBuffer, "play_pos=",         SoundBuffer_play_pos_eql,      1);
+  rb_define_method(cSoundBuffer, "play_pos",          SoundBuffer_play_pos,          0);
+  rb_define_method(cSoundBuffer, "playing?",          SoundBuffer_playing,           0);
+  rb_define_method(cSoundBuffer, "repeat",            SoundBuffer_repeat,            0);
+  rb_define_method(cSoundBuffer, "repeating?",        SoundBuffer_repeating,         0);
+  rb_define_method(cSoundBuffer, "size",              SoundBuffer_size,              0);
+  rb_define_method(cSoundBuffer, "stop",              SoundBuffer_stop,              0);
+  rb_define_method(cSoundBuffer, "stop_and_play",     SoundBuffer_stop_and_play,     0);
+  rb_define_method(cSoundBuffer, "to_s",              SoundBuffer_to_s,              0);
+  rb_define_method(cSoundBuffer, "write",             SoundBuffer_write,            -1);
+  rb_define_method(cSoundBuffer, "write_sync",        SoundBuffer_write_sync,        1);
+  rb_define_method(cSoundBuffer, "effectable?",       SoundBuffer_get_effectable,    0);
 
   rb_define_method(cSoundBuffer, "channels",          SoundBuffer_get_channels,          0);
   rb_define_method(cSoundBuffer, "samples_per_sec",   SoundBuffer_get_samples_per_sec,   0);
@@ -1375,18 +1401,16 @@ Init_SoundBuffer(void)
   rb_define_method(cSoundBuffer, "block_align",       SoundBuffer_get_block_align,       0);
   rb_define_method(cSoundBuffer, "avg_bytes_per_sec", SoundBuffer_get_avg_bytes_per_sec, 0);
 
-  rb_define_method(cSoundBuffer, "get_volume",       SoundBuffer_get_volume,        0);
-  rb_define_method(cSoundBuffer, "set_volume",       SoundBuffer_set_volume,        1);
-  rb_define_method(cSoundBuffer, "get_pan",          SoundBuffer_get_pan,           0);
-  rb_define_method(cSoundBuffer, "set_pan",          SoundBuffer_set_pan,           1);
-  rb_define_method(cSoundBuffer, "get_frequency",    SoundBuffer_get_frequency,     0);
-  rb_define_method(cSoundBuffer, "set_frequency",    SoundBuffer_set_frequency,     1);
-  rb_define_method(cSoundBuffer, "get_effect",       SoundBuffer_get_effect,        0);
-  rb_define_method(cSoundBuffer, "set_effect",       SoundBuffer_set_effect,       -2);
-  rb_define_method(cSoundBuffer, "get_effect_param", SoundBuffer_get_effect_param,  1);
-  rb_define_method(cSoundBuffer, "set_effect_param", SoundBuffer_set_effect_param, -1);
-
-  rb_define_method(cSoundBuffer, "flash",            SoundBuffer_flash,             0);
+  rb_define_method(cSoundBuffer, "get_volume",        SoundBuffer_get_volume,        0);
+  rb_define_method(cSoundBuffer, "set_volume",        SoundBuffer_set_volume,        1);
+  rb_define_method(cSoundBuffer, "get_pan",           SoundBuffer_get_pan,           0);
+  rb_define_method(cSoundBuffer, "set_pan",           SoundBuffer_set_pan,           1);
+  rb_define_method(cSoundBuffer, "get_frequency",     SoundBuffer_get_frequency,     0);
+  rb_define_method(cSoundBuffer, "set_frequency",     SoundBuffer_set_frequency,     1);
+  rb_define_method(cSoundBuffer, "get_effect",        SoundBuffer_get_effect,        0);
+  rb_define_method(cSoundBuffer, "set_effect",        SoundBuffer_set_effect,       -2);
+  rb_define_method(cSoundBuffer, "get_effect_param",  SoundBuffer_get_effect_param,  1);
+  rb_define_method(cSoundBuffer, "set_effect_param",  SoundBuffer_set_effect_param, -1);
 
   rb_define_alias(cSoundBuffer, "volume",     "get_volume");
   rb_define_alias(cSoundBuffer, "volume=",    "set_volume");
@@ -1394,6 +1418,8 @@ Init_SoundBuffer(void)
   rb_define_alias(cSoundBuffer, "pan=",       "set_pan");
   rb_define_alias(cSoundBuffer, "frequency",  "get_frequency");
   rb_define_alias(cSoundBuffer, "frequency=", "set_frequency");
+  rb_define_alias(cSoundBuffer, "pos",        "play_pos");
+  rb_define_alias(cSoundBuffer, "pos=",       "play_pos=");
 
   /*
    * Consts
