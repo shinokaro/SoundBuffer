@@ -67,7 +67,7 @@ static LPDIRECTSOUND8 g_pDSound;
 // RubyのSoundTestオブジェクトが持つC構造体
 struct SoundBuffer {
   LPDIRECTSOUNDBUFFER8  pDSBuffer8;
-  size_t                buffer_size;
+  size_t                buffer_bytes;
   WORD                  channels;
   DWORD                 samples_per_sec;
   WORD                  bits_per_sample;
@@ -118,7 +118,6 @@ SoundBuffer_release(struct SoundBuffer *st)
     st->pDSBuffer8->lpVtbl->Stop(st->pDSBuffer8);
     st->pDSBuffer8->lpVtbl->Release(st->pDSBuffer8);
     st->pDSBuffer8  = NULL;
-    st->buffer_size = 0;
     st->effect_list = Qnil;
 
     // shutduwn+すべてのSoundTestが解放されたらDirectSound解放
@@ -148,7 +147,7 @@ SoundBuffer_memsize(const void *s)
   struct SoundBuffer *st = (struct SoundBuffer *)s;
 
   // ざっくりstruct SoundBufferとバッファのサイズを足して返す
-  return sizeof(struct SoundBuffer) + st->buffer_size;
+  return sizeof(struct SoundBuffer) + st->buffer_bytes;
 }
 
 // SoundTest.newするとまずこれが呼ばれ、次にinitializeが呼ばれる
@@ -163,7 +162,7 @@ SoundBuffer_allocate(VALUE klass)
 
   // allocate時点ではバッファサイズが不明なのでバッファは作らない
   st->pDSBuffer8        = NULL;
-  st->buffer_size       = 0;
+  st->buffer_bytes      = 0;
   st->channels          = 0;
   st->samples_per_sec   = 0;
   st->bits_per_sample   = 0;
@@ -319,7 +318,7 @@ SoundBuffer_play_pos(VALUE self)
 static VALUE
 SoundBuffer_size(VALUE self)
 {
-  return UINT2NUM(get_st(self)->buffer_size);
+  return UINT2NUM(get_st(self)->buffer_bytes);
 }
 
 /*
@@ -344,10 +343,10 @@ SoundBuffer_write(int argc, VALUE *argv, VALUE self)
   bytes  = RSTRING_LEN(vbuffer);
   strptr = RSTRING_PTR(vbuffer);
   offset = NIL_P(voffset) ? 0 : NUM2UINT(voffset);
-  if (bytes  > st->buffer_size)         rb_raise(rb_eRangeError, "string length");
-  if (offset > st->buffer_size)         rb_raise(rb_eRangeError, "offset");
+  if (bytes  > st->buffer_bytes)         rb_raise(rb_eRangeError, "string length");
+  if (offset > st->buffer_bytes)         rb_raise(rb_eRangeError, "offset");
   //if (offset < 0)                       rb_raise(rb_eRangeError, "negative offset");
-  if (offset + bytes > st->buffer_size) rb_raise(rb_eRangeError, "this method is nolap mode");
+  if (offset + bytes > st->buffer_bytes) rb_raise(rb_eRangeError, "this method is nolap mode");
   hr = st->pDSBuffer8->lpVtbl->Lock(st->pDSBuffer8, offset, 0, &ptr1, &size1, &ptr2, &size2, DSBLOCK_ENTIREBUFFER);
   if (FAILED(hr)) to_raise_an_exception(hr);
 
@@ -374,7 +373,7 @@ SoundBuffer_write_sync(VALUE self, VALUE vbuffer)
   bytes  = RSTRING_LEN(vbuffer);
   strptr = RSTRING_PTR(vbuffer);
 
-  if (bytes  > st->buffer_size) rb_raise(rb_eRangeError, "string length");
+  if (bytes  > st->buffer_bytes) rb_raise(rb_eRangeError, "string length");
   hr = st->pDSBuffer8->lpVtbl->Lock(st->pDSBuffer8, 0, bytes, &ptr1, &size1, &ptr2, &size2, DSBLOCK_FROMWRITECURSOR);
   if (FAILED(hr)) to_raise_an_exception(hr);
 
@@ -409,7 +408,7 @@ SoundBuffer_to_s(VALUE self)
   if (st->play_flag) rb_raise(eSoundBufferError, "now playing, plz stop");
   hr = st->pDSBuffer8->lpVtbl->Lock(st->pDSBuffer8, 0, 0, &ptr1, &size1, &ptr2, &size2, DSBLOCK_ENTIREBUFFER);
   if (FAILED(hr)) to_raise_an_exception(hr);
-  if (size1 != st->buffer_size) rb_raise(eSoundBufferError, "can not full lock");
+  if (size1 != st->buffer_bytes) rb_raise(eSoundBufferError, "can not full lock");
   str = rb_str_new(ptr1, size1);
   hr = st->pDSBuffer8->lpVtbl->Unlock(st->pDSBuffer8, ptr1, 0, ptr2, 0);
   if (FAILED(hr)) to_raise_an_exception(hr);
@@ -427,69 +426,64 @@ SoundBuffer_initialize(int argc, VALUE *argv, VALUE self)
   LPDIRECTSOUNDBUFFER pDSBuffer;
   HRESULT hr;
   VALUE   vbuffer, vsamples_per_sec, vbits_per_sample, vchannels, vopt;
-  DWORD   buffer_bytes, samples_per_sec, ctrlfx;
-  WORD    channels, bits_per_sample;
   struct SoundBuffer *st = (struct SoundBuffer *)RTYPEDDATA_DATA(self);
 
   rb_scan_args(argc, argv, "13:", &vbuffer, &vchannels, &vsamples_per_sec, &vbits_per_sample, &vopt);
   switch (TYPE(vbuffer)) {
   case T_FIXNUM:
-    buffer_bytes = NUM2UINT(vbuffer);
+    st->buffer_bytes = NUM2UINT(vbuffer);
     break;
   case T_STRING:
-    buffer_bytes = RSTRING_LEN(vbuffer);
+    st->buffer_bytes = RSTRING_LEN(vbuffer);
     break;
   default:
     rb_raise(rb_eTypeError, "not valid value");
     break;
   }
-  if (buffer_bytes < DSBSIZE_MIN || DSBSIZE_MAX < buffer_bytes) rb_raise(rb_eRangeError, "buffer_size error");
-  channels        = NIL_P(vchannels)        ? 1     : (WORD)NUM2UINT(vchannels);
-  if (channels != 1 && channels != 2) rb_raise(rb_eRangeError, "channels arguments 1 and 2 only possible");
-  samples_per_sec = NIL_P(vsamples_per_sec) ? 48000 : NUM2UINT(vsamples_per_sec);
-  if (samples_per_sec < DSBFREQUENCY_MIN || DSBFREQUENCY_MAX < samples_per_sec) rb_raise(rb_eRangeError, "samples_per_sec argument can be only DSBFREQUENCY_MIN-DSBFREQUENCY_MAX");
-  bits_per_sample = NIL_P(vbits_per_sample) ? 16    : (WORD)NUM2UINT(vbits_per_sample);
-  if (bits_per_sample != 8 && bits_per_sample != 16) rb_raise(rb_eRangeError, "bits_per_sample arguments 8 and 16 only possible");
-  // rb_raise(rb_eRangeError, "STOP!");
-  //ctrlfx = (bits_per_sample == 16) && RTEST(rb_hash_lookup(vopt, ID2SYM(rb_intern("effect")))) ? DSBCAPS_CTRLFX : 0;
-  // ctrlfx = rb_hash_lookup(vopt, ID2SYM(rb_intern("effect"))); core dump????
-  ctrlfx = (bits_per_sample == 16) ? DSBCAPS_CTRLFX : 0;
-  // FX時のDSBSIZE_FX_MIN　(msec)ちぇｃｋ
-  // if (buffer_bytes < sample_per_sec / 1000 * DSBSIZE_FX_MIN) rb_raise();
+  if (st->buffer_bytes < DSBSIZE_MIN || DSBSIZE_MAX < st->buffer_bytes) rb_raise(rb_eRangeError, "buffer size error");
 
+  st->channels        = NIL_P(vchannels)        ? 1     : (WORD)NUM2UINT(vchannels);
+  if (st->channels != 1 && st->channels != 2) rb_raise(rb_eRangeError, "channels arguments 1 and 2 only possible");
 
+  st->samples_per_sec = NIL_P(vsamples_per_sec) ? 48000 :       NUM2UINT(vsamples_per_sec);
+  if (st->samples_per_sec < DSBFREQUENCY_MIN || DSBFREQUENCY_MAX < st->samples_per_sec) rb_raise(rb_eRangeError, "samples_per_sec argument can be only DSBFREQUENCY_MIN-DSBFREQUENCY_MAX");
+
+  st->bits_per_sample = NIL_P(vbits_per_sample) ? 16    : (WORD)NUM2UINT(vbits_per_sample);
+  if (st->bits_per_sample != 8 && st->bits_per_sample != 16) rb_raise(rb_eRangeError, "bits_per_sample arguments 8 and 16 only possible");
+
+  st->ctrlfx_flag = !NIL_P(vopt) && RTEST(rb_hash_aref(vopt, ID2SYM(rb_intern("effect")))) ? DSBCAPS_CTRLFX : 0;
+  if (st->ctrlfx_flag && st->bits_per_sample == 8) rb_raise(rb_eRangeError, "do not use FX, when bits per sample is 8 bit");
+  // 切捨て判定でOKか、あとで調べる。
+  if (st->ctrlfx_flag && st->buffer_bytes < st->samples_per_sec * DSBSIZE_FX_MIN / 1000) rb_raise(rb_eRangeError, "buffer is small, when use FX");
+
+  st->block_align       = st->channels * st->bits_per_sample / 8;
+  st->avg_bytes_per_sec = st->samples_per_sec * st->block_align;
   // フォーマット設定
   pcmwf.wFormatTag      = WAVE_FORMAT_PCM;
-  pcmwf.nChannels       = channels;
-  pcmwf.nSamplesPerSec  = samples_per_sec;
-  pcmwf.wBitsPerSample  = bits_per_sample;
-  pcmwf.nBlockAlign     = pcmwf.nChannels * pcmwf.wBitsPerSample / 8;
-  pcmwf.nAvgBytesPerSec = pcmwf.nSamplesPerSec * pcmwf.nBlockAlign;
+  pcmwf.nChannels       = st->channels;
+  pcmwf.nSamplesPerSec  = st->samples_per_sec;
+  pcmwf.wBitsPerSample  = st->bits_per_sample;
+  pcmwf.nBlockAlign     = st->block_align;
+  pcmwf.nAvgBytesPerSec = st->avg_bytes_per_sec;
   pcmwf.cbSize          = 0;
   // DirectSoundバッファ設定
   desc.dwSize           = sizeof(desc);
-  desc.dwFlags          = DSBCAPS_CTRLFREQUENCY | DSBCAPS_CTRLPAN | DSBCAPS_CTRLVOLUME | ctrlfx
+  desc.dwFlags          = DSBCAPS_CTRLFREQUENCY | DSBCAPS_CTRLPAN | DSBCAPS_CTRLVOLUME | st->ctrlfx_flag
                         | DSBCAPS_LOCSOFTWARE | DSBCAPS_CTRLPOSITIONNOTIFY | DSBCAPS_GETCURRENTPOSITION2
                         | DSBCAPS_GLOBALFOCUS;// | DSBCAPS_STICKYFOCUS;
-  desc.dwBufferBytes    = buffer_bytes;
+  desc.dwBufferBytes    = st->buffer_bytes;
   desc.dwReserved       = 0;
   desc.lpwfxFormat      = &pcmwf;
   desc.guid3DAlgorithm  = DS3DALG_DEFAULT;
 
   // DirectSoundバッファ生成
   hr = g_pDSound->lpVtbl->CreateSoundBuffer(g_pDSound, &desc, &pDSBuffer, NULL);
-  if (FAILED(hr)) rb_raise(eSoundBufferError, "create buffer error");
+  if (FAILED(hr)) rb_raise(eSoundBufferError, "CreateSoundBuffer error");
   hr = pDSBuffer->lpVtbl->QueryInterface(pDSBuffer, &IID_IDirectSoundBuffer8, (void**)&(st->pDSBuffer8));
-  if (FAILED(hr)) rb_raise(eSoundBufferError, "query interface error");
+  if (FAILED(hr)) rb_raise(eSoundBufferError, "QueryInterface error");
   pDSBuffer->lpVtbl->Release(pDSBuffer);
 
-  st->buffer_size       = desc.dwBufferBytes;
-  st->channels          = pcmwf.nChannels;
-  st->samples_per_sec   = pcmwf.nSamplesPerSec;
-  st->bits_per_sample   = pcmwf.wBitsPerSample;
-  st->block_align       = pcmwf.nBlockAlign;
-  st->avg_bytes_per_sec = pcmwf.nAvgBytesPerSec;
-  st->ctrlfx_flag       = ctrlfx ? 1 : 0;
+  st->ctrlfx_flag       = st->ctrlfx_flag ? 1 : 0;
   g_refcount++;
 
   if (TYPE(vbuffer) == T_STRING) SoundBuffer_write(1, &vbuffer, self);
