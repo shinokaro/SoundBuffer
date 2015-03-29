@@ -1716,8 +1716,8 @@ Init_SoundBuffer(void)
   rb_define_method(cSoundBuffer, "block_align",       SoundBuffer_get_block_align,       0);
   rb_define_method(cSoundBuffer, "avg_bytes_per_sec", SoundBuffer_get_avg_bytes_per_sec, 0);
 
-  rb_define_method(cSoundBuffer, "loop",              SoundBuffer_get_loop,          0);
-  rb_define_method(cSoundBuffer, "loop?",             SoundBuffer_set_loop,          1);
+  rb_define_method(cSoundBuffer, "loop?",             SoundBuffer_get_loop,          0);
+  rb_define_method(cSoundBuffer, "loop=",             SoundBuffer_set_loop,          1);
   rb_define_method(cSoundBuffer, "loop_count",        SoundBuffer_get_loop_count,    0);
   rb_define_method(cSoundBuffer, "loop_count=",       SoundBuffer_set_loop_count,    1);
   rb_define_method(cSoundBuffer, "loop_counter",      SoundBuffer_get_loop_counter,  0);
