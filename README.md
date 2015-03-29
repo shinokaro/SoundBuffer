@@ -6,8 +6,6 @@ zlib/libpng License
 
 ## 求む
 * DSERR_BUFFERLOSTがソフトウェアーバッファーでも起きるのかどうか？　の情報
-* SetNotificationPositionsの使い方。これがわからないと区間ループが実装できない。
-* C拡張からオプション引数の使い方。
 
 ## 使い方
 * soundbuffer.so: これ単独でSoundBufferクラスを提供する。
@@ -49,11 +47,10 @@ Thread.new {
 play, repeat, pause, stop, playing?, repeating?, pausing?<br />
 size, write, write_sync, stop_and_play<br />
 get_volume, set_volume, get_pan, set_pan, get_frequency, set_frequency<br />
-volume, volume=, pan, pna=, frequency, frequency=<br />
+volume, volume=, pan, pan=, frequency, frequency=<br />
 etc...
 
 ## 今後の予定
-* プライマリー･バッファーへのアクセスメソッド（マスターボリュームのため）
 * Notifyの利用、それに伴い区間ループの実装
 * デュプリケートの実装。同一音源の同時再生に必要になる。
 * 例外を適切なものにする（たとえばArgumentErrorを使用する）
@@ -63,7 +60,6 @@ etc...
 ## 現在取り組んでいること
 * Dupできるとmemsizeが不正確になるduplicate_flagでは対処できない。disposeをなくすか、マネージャー（class singleton val & method）をいれるか。
 * to_sメソッド。
-* プライマリーバッファーへのアクセス。マスターボリュームの実装に必要。
 * Duplicateの実装。同時発音に必要。ただしFXとの併用はできない。
 
 ## 実装しないもの

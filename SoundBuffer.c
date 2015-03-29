@@ -94,8 +94,9 @@ struct SoundBuffer {
 // notify_wait_blockingの引数に与えるための型データ
 struct NotifyData {
   DWORD     result;
-  DWORD     count;
-  LPHANDLE  handles;
+  struct SoundBuffer* st;
+  //DWORD     count;
+  //LPHANDLE  handles;
   DWORD     timeout;
 };
 
@@ -591,9 +592,18 @@ SoundBuffer_event_offsetstop(VALUE self)
 static void*
 notify_wait_blocking(void *data)
 {
+  DWORD     result;
   struct NotifyData *nd = data;
 
-  nd->result = WaitForMultipleObjects(nd->count, nd->handles, FALSE, nd->timeout);
+  while (1) {
+    result = WaitForMultipleObjects(nd->st->event_count, nd->st->event_handles, FALSE, nd->timeout);
+    if (result == 1 && nd->st->loop_flag) {
+      if ( nd->st->loop_count && nd->st->loop_count > nd->st->loop_counter) nd->st->loop_counter += 1;
+      if (!nd->st->loop_count || nd->st->loop_count > nd->st->loop_counter) set_play_position(nd->st, nd->st->loop_start);
+    }
+    break;
+  }
+  nd->result = result;
   return NULL;
 }
 
@@ -601,14 +611,13 @@ static void
 notify_wait_unblocking(void *data)
 {
   struct NotifyData *nd = data;
-  SetEvent(nd->handles[0]);
+  SetEvent(nd->st->event_handles[0]);
   //printf("unbloking");
 }
 
 /*
  * #wait
 */
-
 static VALUE
 SoundBuffer_wait(int argc, VALUE *argv, VALUE self)
 {
@@ -618,8 +627,7 @@ SoundBuffer_wait(int argc, VALUE *argv, VALUE self)
   if (argc >  1) rb_raise(rb_eArgError, "wrong number of arguments");
 
   data.result  = 0;
-  data.count   = st->event_count;
-  data.handles = st->event_handles;
+  data.st      = st;
   data.timeout = argc ? NUM2UINT(argv[0]) : INFINITE;
 
   while (1) {
@@ -633,11 +641,11 @@ SoundBuffer_wait(int argc, VALUE *argv, VALUE self)
         rb_raise(rb_eStopIteration, "OFFSETSTOP");
         break;
       case 1: // LOOP
-        if (st->loop_flag) {
+      /*  if (st->loop_flag) {
           if ( st->loop_count && st->loop_count > st->loop_counter) st->loop_counter += 1;
           if (!st->loop_count || st->loop_count > st->loop_counter) set_play_position(st, st->loop_start);
           return Qfalse;
-        }
+        }*/
         break;
       default: // USER NOTIFY
         return UINT2NUM(data.result - 2);
