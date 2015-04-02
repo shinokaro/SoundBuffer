@@ -49,4 +49,16 @@ class SoundBuffer
       fx_lst.each_with_index { |fx, idx| set_effect_param(idx, *fx.to_a) }
     }
   end
+
+  def play_loop
+    @thread = Thread.new {wait while playing? || pausing?} if @thread.nil? || !@thread.alive?
+    play
+  end
+  def repeat_loop
+    @thread = Thread.new {wait while playing? || pausing?} if @thread.nil? || !@thread.alive?
+    repeat
+  end
+  def jump(nth)
+    pcm_pos = get_notify[nth]
+  end
 end

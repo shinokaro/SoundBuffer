@@ -51,16 +51,13 @@ volume, volume=, pan, pan=, frequency, frequency=<br />
 etc...
 
 ## 今後の予定
-* Notifyの利用、それに伴い区間ループの実装
-* デュプリケートの実装。同一音源の同時再生に必要になる。
 * 例外を適切なものにする（たとえばArgumentErrorを使用する）
 * サンプルコード
 * テストコード
 
 ## 現在取り組んでいること
-* Dupできるとmemsizeが不正確になるduplicate_flagでは対処できない。disposeをなくすか、マネージャー（class singleton val & method）をいれるか。
 * to_sメソッド。
-* Duplicateの実装。同時発音に必要。ただしFXとの併用はできない。
+* waitスレッドを走らせないと区間ループが作動しない。背後で走らせる仕組み。
 
 ## 実装しないもの
 * readメソッド。DirectSoundの仕様によりバッファーの読み取りは禁止（アドレス不定）されている。ただし、代替としてto_sメソッドは準備中。

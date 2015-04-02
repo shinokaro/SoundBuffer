@@ -56,6 +56,9 @@
 #define FX_I3DL2_REVERB 7
 #define FX_WAVES_REVERB 8
 
+// 通知イベントの固定ハンドル数
+#define EVENT_PRESET    3
+
 // RubyのSoundTestクラス
 static VALUE cSoundBuffer;
 
@@ -69,14 +72,17 @@ static LPDIRECTSOUNDBUFFER  g_pDSBuffer;
 // RubyのSoundTestオブジェクトが持つC構造体
 struct SoundBuffer {
   LPDIRECTSOUNDBUFFER8  pDSBuffer8;
+  VALUE                 origin;
+  DWORD                 copy_flag;
   size_t                buffer_bytes;
   WORD                  channels;
   DWORD                 samples_per_sec;
   WORD                  bits_per_sample;
   WORD                  block_align;
   DWORD                 avg_bytes_per_sec;
-  DWORD                 ctrlfx_flag;
-  VALUE                 effect_list;
+  DWORD                 effect_flag;
+  DWORD                 effect_count;
+  LPDWORD               effect_nums;
   DWORD                 play_flag;
   DWORD                 repeat_flag;
   DWORD                 loop_flag;
@@ -84,18 +90,19 @@ struct SoundBuffer {
   DWORD                 loop_end;
   DWORD                 loop_count;
   DWORD                 loop_counter;
-  LPHANDLE              event_handles;
-  LPDWORD               event_offsets;
   DWORD                 event_count;
-  HANDLE                event_offsetstop;
+  LPDWORD               event_offsets;
+  LPHANDLE              event_handles;
   HANDLE                event_loop_point;
+  HANDLE                event_offsetstop;
+  HANDLE                event_wait_break;
 };
 
 // notify_wait_blockingの引数に与えるための型データ
 struct NotifyData {
   DWORD     result;
-  struct SoundBuffer* st;
   DWORD     timeout;
+  struct SoundBuffer* st;
 };
 
 // プロトタイプ宣言
@@ -108,31 +115,36 @@ static struct SoundBuffer* get_st(VALUE);
 static void   clear_st_event(struct SoundBuffer*);
 static void   to_raise_an_exception(HRESULT);
 static DWORD  get_playing(struct SoundBuffer*);
-
+static void   stop_sound(struct SoundBuffer*);
+static DWORD  row2pcm(struct SoundBuffer*, DWORD);
+static VALUE  row2pcmnum(struct SoundBuffer*, DWORD);
+static DWORD  pcmnum2row(struct SoundBuffer*, VALUE);
+static VALUE  SoundBuffer_set_notify(int, VALUE*, VALUE);
+static void   create_st_event(struct SoundBuffer*, DWORD, LPDWORD);
 // TypedData用の型データ
 const rb_data_type_t SoundBuffer_data_type = {
   "SoundBuffer",
   {
-    SoundBuffer_mark,    // マーク関数
-    SoundBuffer_free,    // 解放関数
-    SoundBuffer_memsize, // サイズ関数
+    SoundBuffer_mark,
+    SoundBuffer_free,
+    SoundBuffer_memsize,
   },
   NULL,
   NULL
 };
 
-// COM終了条件はshutdown+すべてのSoundTestの解放なのでカウントする
+// COM終了条件はshutdown+すべてのSoundBufferの解放なのでカウントする
 static int g_refcount = 0;
 
 /*
  *
  */
-static struct SoundBuffer *
-get_st(VALUE self)
+static void
+SoundBuffer_mark(void *s)
 {
-  struct SoundBuffer *st = (struct SoundBuffer *)RTYPEDDATA_DATA(self);
-  if (!st->pDSBuffer8) rb_raise(eSoundBufferError, "disposed object");
-  return st;
+  struct SoundBuffer *st = (struct SoundBuffer *)s;
+
+  rb_gc_mark(st->origin);
 }
 
 static void
@@ -140,23 +152,65 @@ clear_st_event(struct SoundBuffer *st)
 {
   DWORD i;
 
-  for (i = 0; i < st->event_count; i++) {
-    CloseHandle(st->event_handles[i]);
+  if (st->event_handles) {
+    for (i = 0; i < st->event_count; i++) {
+      if (!(st->event_handles[i] == st->event_loop_point
+         || st->event_handles[i] == st->event_offsetstop
+         || st->event_handles[i] == st->event_wait_break))
+      CloseHandle(st->event_handles[i]);
+    }
+    xfree(st->event_handles);
+    st->event_handles = NULL;
   }
-  xfree(st->event_handles);
-  xfree(st->event_offsets);
-  st->event_handles = NULL;
-  st->event_offsets = NULL;
+  if (st->event_offsets) {
+    xfree(st->event_offsets);
+    st->event_offsets = NULL;
+  }
+  st->event_count = 0;
 }
 
-// GCのマークで呼ばれるマーク関数
 static void
-SoundBuffer_mark(void *s)
+create_st_event_presets(struct SoundBuffer *st)
 {
-  struct SoundBuffer *st = (struct SoundBuffer *)s;
-  // need dispose check
-  // マーク
-  rb_gc_mark(st->effect_list);
+  if (!st->event_loop_point) {
+    st->event_loop_point = CreateEvent(NULL, FALSE, FALSE, NULL);
+    if (!st->event_loop_point) rb_raise(eSoundBufferError, "create_st_event_presets error");
+  }
+  if (!st->event_offsetstop) {
+    st->event_offsetstop = CreateEvent(NULL, TRUE,  FALSE, NULL);
+    if (!st->event_offsetstop) rb_raise(eSoundBufferError, "create_st_event_presets error");
+  }
+  if (!st->event_wait_break) {
+    st->event_wait_break = CreateEvent(NULL, TRUE,  FALSE, NULL);
+    if (!st->event_wait_break) rb_raise(eSoundBufferError, "create_st_event_presets error");
+  }
+}
+
+static void
+clear_st_event_presets(struct SoundBuffer *st)
+{
+  if (st->event_loop_point) {
+    CloseHandle(st->event_loop_point);
+    st->event_loop_point = NULL;
+  }
+  if (st->event_offsetstop) {
+    CloseHandle(st->event_offsetstop);
+    st->event_offsetstop = NULL;
+  }
+  if (st->event_wait_break) {
+    CloseHandle(st->event_wait_break);
+    st->event_wait_break = NULL;
+  }
+}
+
+static void
+clear_st_effect(struct SoundBuffer *st)
+{
+  if (st->effect_nums) {
+    xfree(st->effect_nums);
+    st->effect_nums = NULL;
+  }
+  st->effect_count = 0;
 }
 
 // DirectSoundバッファを開放する内部用関数
@@ -166,9 +220,13 @@ SoundBuffer_release(struct SoundBuffer *st)
   if (st->pDSBuffer8) {
     st->pDSBuffer8->lpVtbl->Stop(st->pDSBuffer8);
     st->pDSBuffer8->lpVtbl->Release(st->pDSBuffer8);
-    st->pDSBuffer8  = NULL;
-    st->effect_list = Qnil;
+    st->pDSBuffer8    = NULL;
+    st->buffer_bytes  = 0;
+    st->origin        = Qnil;
+    clear_st_effect(st);
     clear_st_event(st);
+    clear_st_event_presets(st);
+
     // shutduwn+すべてのSoundTestが解放されたらDirectSound解放
     g_refcount--;
     if (g_refcount == 0) {
@@ -178,29 +236,35 @@ SoundBuffer_release(struct SoundBuffer *st)
   }
 }
 
-// GCで回収されたときに呼ばれる解放関数
 static void
 SoundBuffer_free(void *s)
 {
+  struct SoundBuffer *st = (struct SoundBuffer *)s;
   // バッファ解放
-  SoundBuffer_release((struct SoundBuffer *)s);
-
+  SoundBuffer_release(st);
   // SoundTest解放
-  xfree(s);
+  xfree(st);
 }
 
-// ObjectSpaceからのサイズの問い合わせに応答する
 static size_t
 SoundBuffer_memsize(const void *s)
 {
   struct SoundBuffer *st = (struct SoundBuffer *)s;
 
-  // ざっくりstruct SoundBufferとバッファのサイズを足して返す
-  return sizeof(struct SoundBuffer) + st->buffer_bytes;
-  // Dup対応のため、クラス側にメモリーリストを導入する。
+  return sizeof(struct SoundBuffer)
+       + (st->copy_flag ? 0 : st->buffer_bytes)
+       + st->effect_count * sizeof(DWORD)
+       + st->event_count  * (sizeof(HANDLE) + sizeof(DWORD));
 }
 
-// SoundTest.newするとまずこれが呼ばれ、次にinitializeが呼ばれる
+static struct SoundBuffer *
+get_st(VALUE self)
+{
+  struct SoundBuffer *st = (struct SoundBuffer *)RTYPEDDATA_DATA(self);
+  if (!st->pDSBuffer8) rb_raise(eSoundBufferError, "disposed object");
+  return st;
+}
+
 static VALUE
 SoundBuffer_allocate(VALUE klass)
 {
@@ -212,14 +276,17 @@ SoundBuffer_allocate(VALUE klass)
 
   // allocate時点ではバッファサイズが不明なのでバッファは作らない
   st->pDSBuffer8        = NULL;
+  st->origin            = obj;
+  st->copy_flag         = 0;
   st->buffer_bytes      = 0;
   st->channels          = 0;
   st->samples_per_sec   = 0;
   st->bits_per_sample   = 0;
   st->block_align       = 0;
   st->avg_bytes_per_sec = 0;
-  st->ctrlfx_flag       = 0;
-  st->effect_list       = rb_obj_freeze(rb_ary_new());
+  st->effect_flag       = 0;
+  st->effect_count      = 0;
+  st->effect_nums       = NULL;
   st->play_flag         = 0;
   st->repeat_flag       = 0;
   st->loop_flag         = 0;
@@ -227,9 +294,11 @@ SoundBuffer_allocate(VALUE klass)
   st->loop_end          = 0;
   st->loop_count        = 0;
   st->loop_counter      = 0;
-  st->event_handles     = NULL;
-  st->event_offsets     = NULL;
   st->event_count       = 0;
+  st->event_handles     = NULL;
+  st->event_loop_point  = NULL;
+  st->event_offsets     = NULL;
+  st->event_wait_break  = NULL;
   return obj;
 }
 
@@ -237,23 +306,64 @@ SoundBuffer_allocate(VALUE klass)
  *
  */
 static VALUE
-SoundBuffer_c_duplicate(VALUE self, VALUE vsrc)
+SoundBuffer_initialize_copy(VALUE dst, VALUE src)
 {
+  DWORD   argc;
+  LPDWORD offsets;
   HRESULT hr;
-  VALUE   obj;
-  struct SoundBuffer *src, *dst;
+  struct SoundBuffer *src_st, *dst_st;
 
-  src = get_st(self);
-  obj = SoundBuffer_allocate(cSoundBuffer);
-  dst = (struct SoundBuffer *)RTYPEDDATA_DATA(obj);
+  rb_call_super(1, &src); // If an exception occurs , src object can not be copied object.
+  src_st = get_st(src);   // If an exception occurs , src object is no DSBuffer.
+  dst_st = (struct SoundBuffer *)RTYPEDDATA_DATA(dst);
+  /*
+   *    struct SoundBuffer members & object status
+   *    +-----------+-------+-----------------+-----+-----+
+   *    |pDSBuffer8 |origin |status           |dst? |src? |
+   *    +-----------+-------+-----------------+-----+-----+
+   *    |ptr        |self   |origin object    | NG  | OK  |
+   *    |ptr        |origin |copied object    | NG  | OK  |
+   *    |NULL       |self   |allocated object | OK  | NG  |
+   *    |NULL       |Qnil   |disposed object  | NG  | NG  |
+   *    +-----------+-------+-----------------+-----+-----+
+   */
+  if (dst_st->pDSBuffer8 == NULL && dst_st->origin == dst && src_st->pDSBuffer8) {
+    hr = g_pDSound->lpVtbl->DuplicateSoundBuffer(g_pDSound, (LPDIRECTSOUNDBUFFER)src_st->pDSBuffer8, (LPDIRECTSOUNDBUFFER *)&dst_st->pDSBuffer8);
+    if (FAILED(hr)) to_raise_an_exception(hr);
+    g_refcount++;
+    // object state members
+    dst_st->origin            = src_st->origin;
+    dst_st->copy_flag         = 1;
+    // DSBuffer parameter members
+    dst_st->buffer_bytes      = src_st->buffer_bytes;
+    dst_st->channels          = src_st->channels;
+    dst_st->samples_per_sec   = src_st->samples_per_sec;
+    dst_st->bits_per_sample   = src_st->bits_per_sample;
+    dst_st->block_align       = src_st->block_align;
+    dst_st->avg_bytes_per_sec = src_st->avg_bytes_per_sec;
+    // loop members
+    dst_st->loop_flag         = src_st->loop_flag;
+    dst_st->loop_start        = src_st->loop_start;
+    dst_st->loop_end          = src_st->loop_end;
+    dst_st->loop_count        = src_st->loop_count;
+    dst_st->loop_counter      = 0;
+    // event members
+    // new notify handles setup from src_st->event_offsets
+    create_st_event_presets(dst_st);
+    argc = src_st->event_count - EVENT_PRESET;
+    offsets = ALLOCA_N(DWORD, argc);
+    MEMCPY(offsets, src_st->event_offsets, DWORD, argc);
+    create_st_event(dst_st, argc, offsets);
+  }
+  else rb_raise(rb_eTypeError, "initialize_copy should take allocated object");
 
-  hr = g_pDSound->lpVtbl->DuplicateSoundBuffer(g_pDSound, (LPDIRECTSOUNDBUFFER)src->pDSBuffer8, (LPDIRECTSOUNDBUFFER *)&dst->pDSBuffer8);
-  if (FAILED(hr)) to_raise_an_exception(hr);
- // handles周りのリセットが必要。もちおろんFreeではなくNULL
-  dst = src;
-  g_refcount++;
-  //SoundBuffer_set_notify(0, NULL, self);
-  return obj;
+  return dst;
+}
+
+static VALUE
+SoundBuffer_get_origin(VALUE self)
+{
+  return get_st(self)->origin == self ? Qtrue : Qfalse;
 }
 
 static LPVOID
@@ -267,7 +377,7 @@ DSBcpy(LPVOID ptrA, DWORD lenA, LPVOID ptrB, DWORD lenB, char* ptrS, DWORD lenS,
   lenRest = lenS - writeA;
   if (wlenA != NULL) *wlenA = writeA;
   if (wlenB != NULL) *wlenB = 0;
-  if (ptrB == NULL || lenB == 0 || lenRest == 0) return result;
+  if (ptrB  == NULL || lenB == 0 || lenRest == 0) return result;
   writeB = lenRest < lenB ? lenRest : lenB;
   result = memcpy(ptrB, ptrS + writeA, writeB);
   if (wlenB != NULL) *wlenB = writeB;
@@ -290,15 +400,17 @@ SoundBuffer_write(int argc, VALUE *argv, VALUE self)
   VALUE    vbuffer, voffset, vopt;
   struct SoundBuffer *st = get_st(self);
 
+// taint check & reflect
+
   rb_scan_args(argc, argv, "11:", &vbuffer, &voffset, &vopt);
   // arg1 buffer
   Check_Type(vbuffer, T_STRING);
   bytes  = RSTRING_LEN(vbuffer);
   strptr = RSTRING_PTR(vbuffer);
-  if (bytes  > st->buffer_bytes)         rb_raise(rb_eRangeError, "string length");
+  if (bytes  > st->buffer_bytes) rb_raise(rb_eRangeError, "string length");
   // arg2 offset
   offset = NIL_P(voffset) ? 0 : NUM2UINT(voffset);
-  if (offset > st->buffer_bytes)         rb_raise(rb_eRangeError, "offset");
+  if (offset > st->buffer_bytes) rb_raise(rb_eRangeError, "offset");
   // opt loopying, from_write_cursor
   if (!NIL_P(vopt)) {
     loopying          = RTEST(rb_hash_aref(vopt, ID2SYM(rb_intern("loopying"))))          ? TRUE : FALSE;
@@ -314,34 +426,9 @@ SoundBuffer_write(int argc, VALUE *argv, VALUE self)
     if (loopying) DSBcpy(ptr1, size1, ptr2, size2, strptr, bytes, &write_size1, &write_size2);
     else          DSBcpy(ptr1, size1, NULL,     0, strptr, bytes, &write_size1, NULL);
 
+    if (RTEST(rb_obj_tainted(vbuffer))) rb_obj_taint(self);
+
     hr = st->pDSBuffer8->lpVtbl->Unlock(st->pDSBuffer8, ptr1, write_size1, ptr2, 0);
-    if (FAILED(hr)) rb_raise(eSoundBufferError, "Unlock error");
-  }
-  return UINT2NUM(write_size1 + write_size2);
-}
-
-static VALUE
-SoundBuffer_write_sync(VALUE self, VALUE vbuffer)
-{
-  LPVOID   ptr1,  ptr2;
-  DWORD    size1, size2;
-  DWORD    bytes, write_size1 = 0, write_size2 = 0;
-  char    *strptr;
-  HRESULT  hr;
-  struct SoundBuffer *st = get_st(self);
-
-  Check_Type(vbuffer, T_STRING);
-  bytes  = RSTRING_LEN(vbuffer);
-  strptr = RSTRING_PTR(vbuffer);
-
-  if (bytes  > st->buffer_bytes) rb_raise(rb_eRangeError, "string length");
-  if (bytes) {
-    hr = st->pDSBuffer8->lpVtbl->Lock(st->pDSBuffer8, 0, bytes, &ptr1, &size1, &ptr2, &size2, DSBLOCK_FROMWRITECURSOR);
-    if (FAILED(hr)) to_raise_an_exception(hr);
-
-    DSBcpy(ptr1, size1, ptr2, size2, strptr, bytes, &write_size1, &write_size2);
-
-    hr = st->pDSBuffer8->lpVtbl->Unlock(st->pDSBuffer8, ptr1, write_size1, ptr2, write_size2);
     if (FAILED(hr)) rb_raise(eSoundBufferError, "Unlock error");
   }
   return UINT2NUM(write_size1 + write_size2);
@@ -385,10 +472,10 @@ SoundBuffer_initialize(int argc, VALUE *argv, VALUE self)
   st->bits_per_sample = NIL_P(vbits_per_sample) ? 16    : (WORD)NUM2UINT(vbits_per_sample);
   if (st->bits_per_sample != 8 && st->bits_per_sample != 16) rb_raise(rb_eRangeError, "bits_per_sample arguments 8 and 16 only possible");
 
-  st->ctrlfx_flag = !NIL_P(vopt) && RTEST(rb_hash_aref(vopt, ID2SYM(rb_intern("effect")))) ? DSBCAPS_CTRLFX : 0;
-  if (st->ctrlfx_flag && st->bits_per_sample == 8) rb_raise(rb_eRangeError, "do not use FX, when bits per sample is 8 bit");
+  st->effect_flag = !NIL_P(vopt) && RTEST(rb_hash_aref(vopt, ID2SYM(rb_intern("effect")))) ? 1 : 0;
+  if (st->effect_flag && st->bits_per_sample == 8) rb_raise(rb_eRangeError, "do not use FX, when bits per sample is 8 bit");
   // 切捨て判定でOKか、あとで調べる。
-  if (st->ctrlfx_flag && st->buffer_bytes < st->samples_per_sec * DSBSIZE_FX_MIN / 1000) rb_raise(rb_eRangeError, "buffer is small, when use FX");
+  if (st->effect_flag && st->buffer_bytes < st->samples_per_sec * DSBSIZE_FX_MIN / 1000) rb_raise(rb_eRangeError, "buffer is small, when use FX");
 
   st->block_align       = st->channels * st->bits_per_sample / 8;
   st->avg_bytes_per_sec = st->samples_per_sec * st->block_align;
@@ -402,9 +489,8 @@ SoundBuffer_initialize(int argc, VALUE *argv, VALUE self)
   pcmwf.cbSize          = 0;
   // DirectSoundバッファ設定
   desc.dwSize           = sizeof(desc);
-  desc.dwFlags          = DSBCAPS_CTRLFREQUENCY | DSBCAPS_CTRLPAN | DSBCAPS_CTRLVOLUME | st->ctrlfx_flag
-                        | DSBCAPS_LOCSOFTWARE | DSBCAPS_CTRLPOSITIONNOTIFY | DSBCAPS_GETCURRENTPOSITION2
-                        | DSBCAPS_GLOBALFOCUS;
+  desc.dwFlags          = DSBCAPS_CTRLFREQUENCY | DSBCAPS_CTRLPAN | DSBCAPS_CTRLVOLUME | (st->effect_flag ? DSBCAPS_CTRLFX : 0)
+                        | DSBCAPS_LOCSOFTWARE | DSBCAPS_CTRLPOSITIONNOTIFY | DSBCAPS_GETCURRENTPOSITION2 | DSBCAPS_GLOBALFOCUS;
   desc.dwBufferBytes    = st->buffer_bytes;
   desc.dwReserved       = 0;
   desc.lpwfxFormat      = &pcmwf;
@@ -417,10 +503,10 @@ SoundBuffer_initialize(int argc, VALUE *argv, VALUE self)
   if (FAILED(hr)) rb_raise(eSoundBufferError, "QueryInterface error");
   pDSBuffer->lpVtbl->Release(pDSBuffer);
 
-  st->ctrlfx_flag       = st->ctrlfx_flag ? 1 : 0;
   g_refcount++;
 
   if (TYPE(vbuffer) == T_STRING) SoundBuffer_write(1, &vbuffer, self);
+  create_st_event_presets(st);
   SoundBuffer_set_notify(0, NULL, self);
 
   return self;
@@ -429,6 +515,30 @@ SoundBuffer_initialize(int argc, VALUE *argv, VALUE self)
 /*
  *
  */
+static DWORD
+row2pcm(struct SoundBuffer *st, DWORD n)
+{
+  return n / st->block_align;
+}
+
+static DWORD
+pcm2row(struct SoundBuffer *st, VALUE n)
+{
+  return n * st->block_align;
+}
+
+static VALUE
+row2pcmnum(struct SoundBuffer *st, DWORD n)
+{
+  return UINT2NUM(row2pcm(st, n));
+}
+
+static DWORD
+pcmnum2row(struct SoundBuffer *st, VALUE n)
+{
+  return pcm2row(st, NUM2UINT(n));
+}
+
 static DWORD
 get_play_position(struct SoundBuffer *st)
 {
@@ -452,31 +562,9 @@ set_play_position(struct SoundBuffer *st, DWORD dwNewPosition)
 }
 
 static VALUE
-SoundBuffer_get_pcm_pos(VALUE self)
-{
-  struct SoundBuffer *st = get_st(self);
-
-  return UINT2NUM(get_play_position(st) / st->block_align);
-}
-
-static VALUE
-SoundBuffer_set_pcm_pos(VALUE self, VALUE voffset)
-{
-  struct SoundBuffer *st = get_st(self);
-
-  set_play_position(st, NUM2UINT(voffset) * st->block_align);
-  return UINT2NUM(0);
-}
-
-/*
- *
- */
-static VALUE
 SoundBuffer_get_row_pos(VALUE self)
 {
-  struct SoundBuffer *st = get_st(self);
-
-  return UINT2NUM(get_play_position(st));
+  return UINT2NUM(get_play_position(get_st(self)));
 }
 
 static VALUE
@@ -485,6 +573,23 @@ SoundBuffer_set_row_pos(VALUE self, VALUE voffset)
   struct SoundBuffer *st = get_st(self);
 
   set_play_position(st, NUM2UINT(voffset));
+  return UINT2NUM(0);
+}
+
+static VALUE
+SoundBuffer_get_pcm_pos(VALUE self)
+{
+  struct SoundBuffer *st = get_st(self);
+
+  return UINT2NUM(row2pcm(st, get_play_position(st)));
+}
+
+static VALUE
+SoundBuffer_set_pcm_pos(VALUE self, VALUE voffset)
+{
+  struct SoundBuffer *st = get_st(self);
+
+  set_play_position(st, pcm2row(st, NUM2UINT(voffset)));
   return UINT2NUM(0);
 }
 
@@ -497,6 +602,13 @@ SoundBuffer_size(VALUE self)
   return UINT2NUM(get_st(self)->buffer_bytes);
 }
 
+static VALUE
+SoundBuffer_total(VALUE self)
+{
+  struct SoundBuffer *st = get_st(self);
+
+  return UINT2NUM(st->buffer_bytes / st->block_align);
+}
 /*
  *
  */
@@ -513,11 +625,18 @@ SoundBuffer_to_s(VALUE self)
   if (get_playing(st)) rb_raise(eSoundBufferError, "now playing, plz stop");
   hr = st->pDSBuffer8->lpVtbl->Lock(st->pDSBuffer8, 0, 0, &ptr1, &size1, &ptr2, &size2, DSBLOCK_ENTIREBUFFER);
   if (FAILED(hr)) to_raise_an_exception(hr);
-  if (size1 != st->buffer_bytes) rb_raise(eSoundBufferError, "can not full lock");
-  str = rb_str_new(ptr1, size1); // RB_GC_GUARD必要？
-  hr = st->pDSBuffer8->lpVtbl->Unlock(st->pDSBuffer8, ptr1, 0, ptr2, 0);
-  if (FAILED(hr)) to_raise_an_exception(hr);
-  return str;
+
+  if (size1 == st->buffer_bytes) {
+    str = rb_str_new(ptr1, size1);
+    hr = st->pDSBuffer8->lpVtbl->Unlock(st->pDSBuffer8, ptr1, 0, ptr2, 0);
+    if (FAILED(hr)) to_raise_an_exception(hr);
+    return str;
+  }
+  else {
+    hr = st->pDSBuffer8->lpVtbl->Unlock(st->pDSBuffer8, ptr1, 0, ptr2, 0);
+    if (FAILED(hr)) to_raise_an_exception(hr);
+    rb_raise(eSoundBufferError, "can not full lock");
+  }
 }
 
 /*
@@ -573,7 +692,7 @@ SoundBuffer_get_avg_bytes_per_sec(VALUE self)
 static VALUE
 SoundBuffer_get_effectable(VALUE self)
 {
-  return get_st(self)->ctrlfx_flag ? Qtrue : Qfalse;
+  return get_st(self)->effect_flag ? Qtrue : Qfalse;
 }
 /*
  * エフェクトパラメーター反映のためのメソッド
@@ -596,30 +715,8 @@ SoundBuffer_flash(VALUE self)
 }
 
 /*
- * nortify wait
+ * nortify
  */
-static VALUE
-SoundBuffer_event_offsetstop(VALUE self)
-{
-  return PulseEvent(get_st(self)->event_handles[0]) ? Qtrue : Qfalse;
-}
-
-static HRESULT
-notify_set_stop(struct SoundBuffer *st)
-{
-  HRESULT   hr;
-  DWORD     dwCurrentPlayCursor;
-  DWORD     dwCurrentWriteCursor;
-
-  hr = st->pDSBuffer8->lpVtbl->GetCurrentPosition(st->pDSBuffer8, &dwCurrentPlayCursor, &dwCurrentWriteCursor);
-  if (!st->repeat_flag && dwCurrentPlayCursor == 0) {
-    st->play_flag    = 0;
-    st->repeat_flag  = 0;
-    st->loop_counter = 0;
-  }
-  return hr;
-}
-
 static HRESULT
 notify_set_loop(struct SoundBuffer *st)
 {
@@ -635,128 +732,168 @@ notify_set_loop(struct SoundBuffer *st)
 static void*
 notify_wait_blocking(void *data)
 {
-  struct NotifyData *nd = data;
+  struct NotifyData  *nd = data;
+  struct SoundBuffer *st = nd->st;
 
   while (1) {
-    nd->result = WaitForMultipleObjects(nd->st->event_count, nd->st->event_handles, FALSE, nd->timeout);
-    if (nd->result == 1) notify_set_loop(nd->st); else break;
+    nd->result = WaitForMultipleObjects(st->event_count, st->event_handles, FALSE, nd->timeout);
+    if (nd->result - WAIT_OBJECT_0 == st->event_count - 3) notify_set_loop(st);
+    else return NULL;
   }
-  if (nd->result == 0) notify_set_stop(nd->st);
-  return NULL;
 }
 
 static void
 notify_wait_unblocking(void *data)
 {
-  struct NotifyData *nd = data;
-  SetEvent(nd->st->event_handles[0]);
-  //printf("unbloking");
+  struct NotifyData  *nd = data;
+  struct SoundBuffer *st = nd->st;
+
+  SetEvent(st->event_wait_break);
 }
 
-/*
- * #wait
-*/
 static VALUE
 SoundBuffer_wait(int argc, VALUE *argv, VALUE self)
 {
+  DWORD result;
   struct NotifyData  data;
   struct SoundBuffer *st = get_st(self);
 
-  if (argc >  1) rb_raise(rb_eArgError, "wrong number of arguments");
+  if (argc > 1) rb_raise(rb_eArgError, "wrong number of arguments");
 
   data.result  = 0;
   data.st      = st;
   data.timeout = argc ? NUM2UINT(argv[0]) : INFINITE;
-
   while (1) {
     rb_thread_call_without_gvl(notify_wait_blocking, (void*)(&data), notify_wait_unblocking, (void*)(&data));
-    if (data.result == WAIT_FAILED)  rb_raise(eSoundBufferError, "[BUG]:WaitForMultipleObjects error in notify_wait_blocking C function");
-    if (data.result == WAIT_TIMEOUT) return Qnil;
-    ResetEvent(st->event_handles[data.result]);
-    switch (data.result) {
-      case 0: // OFFSETSTOP
-        rb_raise(rb_eStopIteration, "OFFSETSTOP");
-        break;
-      case 1: // LOOP
-        break;
-      default: // USER NOTIFY
-        return UINT2NUM(data.result - 2);
-        break;
-    }
+    if (data.result - WAIT_OBJECT_0 != st->event_count - 1) break;
   }
+  if (data.result == WAIT_FAILED)  rb_raise(eSoundBufferError, "[BUG]WaitForMultipleObjects error in notify_wait_blocking C function");
+  if (data.result == WAIT_TIMEOUT) return Qnil;
+  result = data.result - WAIT_OBJECT_0;
+  ResetEvent(st->event_handles[result]);
+  // OFFSETSTOP
+  if (result == st->event_count - 2) {
+    if (st->repeat_flag == 0 && get_play_position(st) == 0) SoundBuffer_stop(self);
+    rb_raise(rb_eStopIteration, "OFFSETSTOP");
+  }
+  // User event
+  return UINT2NUM(result);
+}
+
+static LPHANDLE
+notify_create_handles(struct SoundBuffer *st, DWORD count)
+{
+  LPHANDLE  handles;
+  DWORD     i, j;
+
+  handles = ALLOC_N(HANDLE, count);
+  for (i = 0; i < count; i++) {
+    if      (i == count - 1)  handles[i] = st->event_wait_break;
+    else if (i == count - 2)  handles[i] = st->event_offsetstop;
+    else if (i == count - 3)  handles[i] = st->event_loop_point;
+    else                      handles[i] = CreateEvent(NULL, TRUE, FALSE, NULL);
+    if (handles[i] == NULL) break;
+  }
+  if (i < count) {
+    for (j = 0; j < i; j++) CloseHandle(handles[j]);
+    xfree(handles);
+    rb_raise(eSoundBufferError, "notify_create_handles error");
+  }
+  return handles;
+}
+
+static LPDWORD
+notify_create_offsets(struct SoundBuffer *st, DWORD count, DWORD *dwoffsets)
+{
+  LPDWORD   offsets;
+  DWORD     i;
+
+  offsets = ALLOC_N(DWORD, count);
+  for (i = 0; i < count; i++) {
+    if      (i == count - 1)  offsets[i] = 0; // DUMMY
+    else if (i == count - 2)  offsets[i] = DSBPN_OFFSETSTOP;
+    else if (i == count - 3)  offsets[i] = st->loop_end;
+    else                      offsets[i] = dwoffsets[i];
+  }
+  return offsets;
+}
+
+static HRESULT
+notify_SetNotificationPositions(struct SoundBuffer *st, DWORD count, LPDWORD offsets, LPHANDLE handles)
+{
+  LPDIRECTSOUNDNOTIFY8  lpDsNotify;
+  LPDSBPOSITIONNOTIFY   PositionNotify;
+  DWORD                 i, notify_count;
+  HRESULT               hr;
+
+  hr = st->pDSBuffer8->lpVtbl->QueryInterface(st->pDSBuffer8, &IID_IDirectSoundNotify8, (LPVOID*)&lpDsNotify);
+  if (SUCCEEDED(hr)) {
+    // event_wait_breakはセットしない。よってcount - 1。また、サンプル位置０にnortifyをセットできる。
+    notify_count = count - 1;
+    PositionNotify = ALLOCA_N(DSBPOSITIONNOTIFY, notify_count);
+    for (i = 0; i < notify_count; i++) {
+      PositionNotify[i].dwOffset     = offsets[i];
+      PositionNotify[i].hEventNotify = handles[i];
+    }
+    hr = lpDsNotify->lpVtbl->SetNotificationPositions(lpDsNotify, notify_count, PositionNotify);
+  }
+  lpDsNotify->lpVtbl->Release(lpDsNotify);
+  return hr;
+}
+
+static void
+create_st_event(struct SoundBuffer *st, DWORD argc, LPDWORD dwoffsets)
+{
+  LPHANDLE handles;
+  LPDWORD  offsets;
+  DWORD    i, count;
+  HRESULT  hr;
+
+  count   = argc + EVENT_PRESET;
+  offsets = notify_create_offsets(st, count, dwoffsets);
+  handles = notify_create_handles(st, count);
+  hr = notify_SetNotificationPositions(st, count, offsets, handles);
+  if (SUCCEEDED(hr)) {
+    clear_st_event(st);
+    st->event_count   = count;
+    st->event_offsets = offsets;
+    st->event_handles = handles;
+  }
+  else {
+    xfree(offsets);
+    for (i = 0; i < count - EVENT_PRESET; i++) CloseHandle(handles[i]);
+    xfree(handles);
+    to_raise_an_exception(hr);
+  }
+  PulseEvent(st->event_wait_break);
 }
 
 static VALUE
 SoundBuffer_set_notify(int argc, VALUE *argv, VALUE self)
 {
-  LPDIRECTSOUNDNOTIFY8  lpDsNotify;
-  LPHANDLE              event_handles;
-  LPDSBPOSITIONNOTIFY   PositionNotify;
-  LPDWORD               event_offsets;
-  DWORD                 i, j, count, base = 2;
-  HRESULT               hr;
+  int      i;
+  LPDWORD  dwoffsets;
   struct SoundBuffer *st = get_st(self);
 
-// when play raise expect
-// stop sound
-  count = argc + base;
-  /*
-   *  offset setup
-   */
-  event_offsets = ALLOC_N(DWORD, count);
-  event_offsets[0] = DSBPN_OFFSETSTOP;
-  event_offsets[1] = st->loop_end;
-  for (i = base; i < count; i++) {
-    event_offsets[i] = NUM2UINT(argv[i - base]) * st->block_align;
-    if (event_offsets[i] > st->buffer_bytes) break;
-  }
-  if (i < count) {
-    xfree(event_offsets);
-    rb_raise(rb_eRangeError, "offset has exceeded the buffer size");
-  }
-  /*
-   *  get Interface
-   */
-  hr = st->pDSBuffer8->lpVtbl->QueryInterface(st->pDSBuffer8, &IID_IDirectSoundNotify8, (LPVOID*)&lpDsNotify);
-  if (FAILED(hr)) rb_raise(eSoundBufferError, "QueryInterface error, when set nortify");
-  /*
-   *  handle setup
-   */
-  event_handles = ALLOC_N(HANDLE, count);
-  for (i = 0; i < count; i++) {
-    event_handles[i] = CreateEvent(NULL, (i != 1), FALSE, NULL);
-    if (event_handles[i] == NULL) break;
-  }
-  if (i < count) {
-    for (j = 0; j < i; j++) {
-      CloseHandle(event_handles[j]);
-    }
-    xfree(event_handles);
-    rb_raise(eSoundBufferError, "CreateEvent error");
-  }
-  PositionNotify = ALLOC_N(DSBPOSITIONNOTIFY, count);
-  for (i = 0; i < count; i++) {
-    PositionNotify[i].dwOffset     = event_offsets[i];
-    PositionNotify[i].hEventNotify = event_handles[i];
-  }
-  hr = lpDsNotify->lpVtbl->SetNotificationPositions(lpDsNotify, count, PositionNotify);
-  xfree(PositionNotify);
-  if (SUCCEEDED(hr)) {
-    clear_st_event(st);
-    st->event_handles = event_handles;
-    st->event_offsets = event_offsets;
-    st->event_count   = count;
-  }
-  else {
-    for (i = 0; i < count; i++) {
-      CloseHandle(event_handles[i]);
-    }
-    xfree(event_handles);
-    xfree(event_offsets);
-  }
-  lpDsNotify->lpVtbl->Release(lpDsNotify);
-  if (FAILED(hr)) to_raise_an_exception(hr);
+  dwoffsets = ALLOCA_N(DWORD, argc);
+  for (i = 0; i < argc; i++) dwoffsets[i] = pcmnum2row(st, argv[i]);
+
+  create_st_event(st, argc, dwoffsets);
   return self;
+}
+
+static VALUE
+SoundBuffer_get_notify(VALUE self)
+{
+  DWORD i;
+  VALUE ary;
+  struct SoundBuffer *st = get_st(self);
+
+  ary = rb_ary_new();
+  if (st->event_count >= EVENT_PRESET) {
+    for(i = 0; i < st->event_count - EVENT_PRESET; i++) rb_ary_store(ary, i, row2pcmnum(st, st->event_offsets[i]));
+  }
+  return ary;
 }
 
 /*
@@ -847,6 +984,7 @@ get_play_status(struct SoundBuffer *st)
   if (FAILED(hr)) to_raise_an_exception(hr);
   return dwStatus;
 }
+
 /*
 static void
 reflect_play_status(struct SoundBuffer *st)
@@ -903,66 +1041,79 @@ SoundBuffer_set_loop(VALUE self, VALUE v)
   get_st(self)->loop_flag = RTEST(v);
   return self;
 }
+
 static VALUE
 SoundBuffer_set_loop_start(VALUE self, VALUE v)
 {
   DWORD n;
   struct SoundBuffer *st = get_st(self);
 
-  n = NUM2UINT(v) * st->block_align;
+  n = pcmnum2row(st, v);
   if (n > st->buffer_bytes) rb_raise(rb_eRangeError, "buffer_size");
   st->loop_start = n;
   return self;
 }
+
 static VALUE
 SoundBuffer_set_loop_end(VALUE self, VALUE v)
 {
-  DWORD n;
+  DWORD   n, argc;
+  LPDWORD offsets;
   struct SoundBuffer *st = get_st(self);
 
-  n = NUM2UINT(v) * st->block_align;
+  n = pcmnum2row(st, v);
   if (n > st->buffer_bytes) rb_raise(rb_eRangeError, "buffer_size");
   st->loop_end = n;
+
+  argc = st->event_count - EVENT_PRESET;
+  offsets = ALLOCA_N(DWORD, argc);
+  MEMCPY(offsets, st->event_offsets, DWORD, argc);
+  create_st_event(st, argc, offsets);
+
   return self;
 }
+
 static VALUE
 SoundBuffer_set_loop_count(VALUE self, VALUE v)
 {
   get_st(self)->loop_count = NUM2UINT(v);
   return self;
 }
+
 static VALUE
 SoundBuffer_set_loop_counter(VALUE self, VALUE v)
 {
-  get_st(self)->loop_count = NUM2UINT(v);
+  get_st(self)->loop_counter = NUM2UINT(v);
   return self;
 }
+
 static VALUE
 SoundBuffer_get_loop_start(VALUE self)
 {
   struct SoundBuffer *st = get_st(self);
 
-  return UINT2NUM(st->loop_start / st->block_align);
+  return row2pcmnum(st, st->loop_start);
 }
+
 static VALUE
 SoundBuffer_get_loop_end(VALUE self)
 {
   struct SoundBuffer *st = get_st(self);
 
-  return UINT2NUM(st->loop_flag / st->block_align);
+  return row2pcmnum(st, st->loop_end);
 }
+
 static VALUE
 SoundBuffer_get_loop_count(VALUE self)
 {
-  return UINT2NUM(get_st(self)->loop_flag);
+  return UINT2NUM(get_st(self)->loop_count);
 }
+
 static VALUE
 SoundBuffer_get_loop_counter(VALUE self)
 {
-  return UINT2NUM(get_st(self)->loop_flag);
+  return UINT2NUM(get_st(self)->loop_counter);
 }
-
-
 /*
  *
  */
@@ -1071,34 +1222,36 @@ SoundBuffer_set_frequency(VALUE self, VALUE vfrequency)
 static VALUE
 SoundBuffer_get_effect(VALUE self)
 {
+  DWORD i;
+  VALUE ary;
   struct SoundBuffer *st = get_st(self);
-  if (!st->ctrlfx_flag) rb_raise(rb_eNotImpError, "this object is not effect support");
-  return st->effect_list;
+
+  if (!st->effect_flag) rb_raise(rb_eNotImpError, "this object is not effect support");
+  ary = rb_ary_new();
+  for (i = 0; i < st->effect_count; i++) rb_ary_store(ary, i, UINT2NUM(st->effect_nums[i]));
+  return ary;
 }
+
 /*
  * set_effect
  * 再生中のエフェクトリスト変更はエラーになる
  */
 static VALUE
-SoundBuffer_set_effect(VALUE self, VALUE vargs)
+SoundBuffer_set_effect(int argc, VALUE *argv, VALUE self)
 {
-  HRESULT           hr;
-  unsigned long     count;
-  unsigned long     i;
-  GUID              guid;
-  LPDSEFFECTDESC    pDSFXDesc;
+  DWORD          i, count;
+  GUID           guid;
+  LPDSEFFECTDESC pDSFXDesc;
+  HRESULT        hr;
   struct SoundBuffer *st = get_st(self);
 
-  if (!st->ctrlfx_flag) rb_raise(rb_eNotImpError, "this object is not effect support");
-  Check_Type(vargs, T_ARRAY);
+  if (!st->effect_flag) rb_raise(rb_eNotImpError, "this object is not effect support");
 
-  // エフェクトリストのサイズ取得
-  count = RARRAY_LEN(vargs);
+  count = (DWORD)argc;
   if (count > 0) {
     pDSFXDesc = ALLOCA_N(DSEFFECTDESC, count);
-
     for (i = 0; i < count; i++) {
-      switch (NUM2INT(rb_ary_entry(vargs, i))) {
+      switch (NUM2UINT(argv[i])) {
         case FX_GARGLE:
           guid = GUID_DSFX_STANDARD_GARGLE;
           break;
@@ -1131,7 +1284,7 @@ SoundBuffer_set_effect(VALUE self, VALUE vargs)
           break;
       }
       pDSFXDesc[i].dwSize        = sizeof(DSEFFECTDESC);
-      pDSFXDesc[i].dwFlags       = DSFX_LOCSOFTWARE;      // dwFlagは強制的にソフトウェアー配置になるよう設定
+      pDSFXDesc[i].dwFlags       = DSFX_LOCSOFTWARE;      // dwFlagは強制的にソフトウェアー配置
       pDSFXDesc[i].guidDSFXClass = guid;
       pDSFXDesc[i].dwReserved1   = 0;
       pDSFXDesc[i].dwReserved2   = 0;
@@ -1140,10 +1293,11 @@ SoundBuffer_set_effect(VALUE self, VALUE vargs)
   }
   else hr = st->pDSBuffer8->lpVtbl->SetFX(st->pDSBuffer8,  0,      NULL, NULL);
 
-  // 再生中に呼び出したときに出るエラー
-  if (hr == DSERR_INVALIDCALL) rb_raise(eSoundBufferError, "object is playing (DSERR_INVALIDCALL)");
   if (FAILED(hr)) to_raise_an_exception(hr);
-  st->effect_list = rb_obj_freeze(vargs);
+  clear_st_effect(st);
+  st->effect_nums  = count ? ALLOC_N(DWORD, count) : NULL;
+  for (i = 0; i < count; i++) st->effect_nums[i] = NUM2UINT(argv[i]);
+  st->effect_count = count;
   return self;
 }
 
@@ -1561,10 +1715,13 @@ SoundBuffer_SetAllParameters_DSFXWavesReverb(int argc, VALUE *argv, VALUE self)
 static VALUE
 SoundBuffer_get_effect_param(VALUE self, VALUE nth)
 {
+  DWORD idx;
   struct SoundBuffer *st = get_st(self);
 
-  if (!st->ctrlfx_flag) rb_raise(rb_eNotImpError, "this object is not effect support");
-  switch (NUM2UINT(rb_ary_entry(st->effect_list, NUM2UINT(nth)))) {
+  if (!st->effect_flag) rb_raise(rb_eNotImpError, "this object is not effect support");
+  idx = NUM2UINT(nth);
+  if (idx > st->effect_count) rb_raise(rb_eRangeError, "effect index error");
+  switch (st->effect_nums[idx]) {
     case FX_GARGLE:
       return SoundBuffer_GetAllParameters_DSFXGargle(self, nth);
       break;
@@ -1603,10 +1760,13 @@ SoundBuffer_get_effect_param(VALUE self, VALUE nth)
 static VALUE
 SoundBuffer_set_effect_param(int argc, VALUE *argv, VALUE self)
 {
+  DWORD idx;
   struct SoundBuffer *st = get_st(self);
 
-  if (!st->ctrlfx_flag) rb_raise(rb_eNotImpError, "this object is not effect support");
-  switch (NUM2UINT(rb_ary_entry(st->effect_list, NUM2UINT(argv[0])))) {
+  if (!st->effect_flag) rb_raise(rb_eNotImpError, "this object is not effect support");
+  idx = NUM2UINT(argv[0]);
+  if (idx > st->effect_count) rb_raise(rb_eRangeError, "effect index error");
+  switch (st->effect_nums[idx]) {
     case FX_GARGLE:
       return SoundBuffer_SetAllParameters_DSFXGargle(argc, argv, self);
       break;
@@ -1668,8 +1828,6 @@ SoundBuffer_c_set_format(VALUE self, VALUE vchannels, VALUE vsamples_per_sec, VA
   WORD          channels, bits_per_sample;
   DWORD         samples_per_sec;
 
-  // if (st->pDSBuffer8) rb_raise(eSoundBufferError, "object is already initialized");
-
   channels        = (WORD)NUM2UINT(vchannels);
   if (channels != 1 && channels != 2) rb_raise(rb_eRangeError, "channels arguments 1 and 2 only possible");
   samples_per_sec =       NUM2UINT(vsamples_per_sec);
@@ -1699,9 +1857,7 @@ SoundBuffer_c_get_volume(VALUE self)
   if (FAILED(hr)) to_raise_an_exception(hr);
   return INT2NUM(volume);
 }
-/*
- * SoundBuffer#set_volume
- */
+
 static VALUE
 SoundBuffer_c_set_volume(VALUE self, VALUE vvolume)
 {
@@ -1712,6 +1868,7 @@ SoundBuffer_c_set_volume(VALUE self, VALUE vvolume)
   if (FAILED(hr)) to_raise_an_exception(hr);
   return vvolume;
 }
+
 // Rubyのクラス定義
 void
 Init_SoundBuffer(void)
@@ -1721,21 +1878,22 @@ Init_SoundBuffer(void)
   cSoundBuffer = rb_define_class("SoundBuffer", rb_cObject);
 
   rb_define_alloc_func(cSoundBuffer, SoundBuffer_allocate);
-  rb_define_singleton_method(cSoundBuffer, "duplicate",  SoundBuffer_c_duplicate,   1);
-  rb_define_singleton_method(cSoundBuffer, "get_format", SoundBuffer_c_get_format,  0);
-  rb_define_singleton_method(cSoundBuffer, "set_format", SoundBuffer_c_set_format,  3);
-  rb_define_singleton_method(cSoundBuffer, "get_volume", SoundBuffer_c_get_volume,  0);
-  rb_define_singleton_method(cSoundBuffer, "set_volume", SoundBuffer_c_set_volume,  1);
+  rb_define_singleton_method(cSoundBuffer, "get_format", SoundBuffer_c_get_format,   0);
+  rb_define_singleton_method(cSoundBuffer, "set_format", SoundBuffer_c_set_format,   3);
+  rb_define_singleton_method(cSoundBuffer, "get_volume", SoundBuffer_c_get_volume,   0);
+  rb_define_singleton_method(cSoundBuffer, "set_volume", SoundBuffer_c_set_volume,   1);
 
-  rb_define_private_method(cSoundBuffer, "initialize", SoundBuffer_initialize, -1);
+  rb_define_method(cSoundBuffer, "initialize",        SoundBuffer_initialize,       -1);
+  rb_define_method(cSoundBuffer, "initialize_copy",   SoundBuffer_initialize_copy,   1);
 
-  rb_define_method(cSoundBuffer, "_event",            SoundBuffer_event_offsetstop, 0);
   rb_define_method(cSoundBuffer, "wait",              SoundBuffer_wait,             -1);
+  rb_define_method(cSoundBuffer, "get_notify",        SoundBuffer_get_notify,        0);
   rb_define_method(cSoundBuffer, "set_notify",        SoundBuffer_set_notify,       -1);
 
   rb_define_method(cSoundBuffer, "dispose",           SoundBuffer_dispose,           0);
   rb_define_method(cSoundBuffer, "disposed?",         SoundBuffer_disposed,          0);
   rb_define_method(cSoundBuffer, "flash",             SoundBuffer_flash,             0);
+  rb_define_method(cSoundBuffer, "origin?",           SoundBuffer_get_origin,        0);
   rb_define_method(cSoundBuffer, "pause",             SoundBuffer_pause,             0);
   rb_define_method(cSoundBuffer, "pausing?",          SoundBuffer_pausing,           0);
   rb_define_method(cSoundBuffer, "play",              SoundBuffer_play,              0);
@@ -1746,8 +1904,8 @@ Init_SoundBuffer(void)
   rb_define_method(cSoundBuffer, "stop",              SoundBuffer_stop,              0);
   rb_define_method(cSoundBuffer, "stop_and_play",     SoundBuffer_stop_and_play,     0);
   rb_define_method(cSoundBuffer, "to_s",              SoundBuffer_to_s,              0);
+  rb_define_method(cSoundBuffer, "total",             SoundBuffer_total,             0);
   rb_define_method(cSoundBuffer, "write",             SoundBuffer_write,            -1);
-  rb_define_method(cSoundBuffer, "write_sync",        SoundBuffer_write_sync,        1);
   rb_define_method(cSoundBuffer, "effectable?",       SoundBuffer_get_effectable,    0);
 
   rb_define_method(cSoundBuffer, "channels",          SoundBuffer_get_channels,          0);
@@ -1778,7 +1936,7 @@ Init_SoundBuffer(void)
   rb_define_method(cSoundBuffer, "get_frequency",     SoundBuffer_get_frequency,     0);
   rb_define_method(cSoundBuffer, "set_frequency",     SoundBuffer_set_frequency,     1);
   rb_define_method(cSoundBuffer, "get_effect",        SoundBuffer_get_effect,        0);
-  rb_define_method(cSoundBuffer, "set_effect",        SoundBuffer_set_effect,       -2);
+  rb_define_method(cSoundBuffer, "set_effect",        SoundBuffer_set_effect,       -1);
   rb_define_method(cSoundBuffer, "get_effect_param",  SoundBuffer_get_effect_param,  1);
   rb_define_method(cSoundBuffer, "set_effect_param",  SoundBuffer_set_effect_param, -1);
 
