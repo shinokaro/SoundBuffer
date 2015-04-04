@@ -50,15 +50,23 @@ class SoundBuffer
     }
   end
 
-  def play_loop
-    @thread = Thread.new {wait while playing? || pausing?} if @thread.nil? || !@thread.alive?
-    play
-  end
-  def repeat_loop
-    @thread = Thread.new {wait while playing? || pausing?} if @thread.nil? || !@thread.alive?
-    repeat
-  end
   def jump(nth)
-    pcm_pos = get_notify[nth]
+    self.pcm_pos = get_notify[nth]
+  end
+
+  def loop=(flag)
+    @__thread = nil unless instance_variable_defined?(:@__thread)
+    if flag
+      set_loop(true)
+      if @__thread.nil? || !@__thread.alive?
+        @__thread = Thread.new { loop { wait; p :stop } while true }
+      end
+    else
+      set_loop(false)
+      if !@__thread.nil? || @__thread.alive?
+        @__thread.kill
+        @__thread = nil
+      end
+    end
   end
 end

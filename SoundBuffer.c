@@ -26,6 +26,7 @@
  */
 #include "ruby.h"
 #include "ruby/thread.h"
+#include <string.h>
 /*
  * DirectSoundではGUIDを引数に使用することがある。
  * GUID_NULLの定義が必要になる。このためks.hファイルとlibuuidをリンクする必要がある。
@@ -41,8 +42,8 @@
  * そのため__nullを自前で定義する必要がある。
  */
 #define __null
+#define DIRECTSOUND_VERSION 0x0900
 #include <dsound.h>
-#include <string.h>
 
 // Ruby側のエフェクト指定用の定数
 // クラス定義のセクションでRuby定数定義を行っている。
@@ -625,18 +626,16 @@ SoundBuffer_to_s(VALUE self)
   if (get_playing(st)) rb_raise(eSoundBufferError, "now playing, plz stop");
   hr = st->pDSBuffer8->lpVtbl->Lock(st->pDSBuffer8, 0, 0, &ptr1, &size1, &ptr2, &size2, DSBLOCK_ENTIREBUFFER);
   if (FAILED(hr)) to_raise_an_exception(hr);
-
-  if (size1 == st->buffer_bytes) {
-    str = rb_str_new(ptr1, size1);
+  if (size1 != st->buffer_bytes) {
     hr = st->pDSBuffer8->lpVtbl->Unlock(st->pDSBuffer8, ptr1, 0, ptr2, 0);
     if (FAILED(hr)) to_raise_an_exception(hr);
-    return str;
+    rb_raise(eSoundBufferError, "can not full size lock");
   }
-  else {
-    hr = st->pDSBuffer8->lpVtbl->Unlock(st->pDSBuffer8, ptr1, 0, ptr2, 0);
-    if (FAILED(hr)) to_raise_an_exception(hr);
-    rb_raise(eSoundBufferError, "can not full lock");
-  }
+  str = rb_str_new(ptr1, size1);
+  if (rb_obj_tainted(self)) rb_obj_taint(str);
+  hr = st->pDSBuffer8->lpVtbl->Unlock(st->pDSBuffer8, ptr1, 0, ptr2, 0);
+  if (FAILED(hr)) to_raise_an_exception(hr);
+  return str;
 }
 
 /*
@@ -737,7 +736,13 @@ notify_wait_blocking(void *data)
 
   while (1) {
     nd->result = WaitForMultipleObjects(st->event_count, st->event_handles, FALSE, nd->timeout);
-    if (nd->result - WAIT_OBJECT_0 == st->event_count - 3) notify_set_loop(st);
+    /* DEBUG CODE
+    if      (st->event_handles[nd->result - WAIT_OBJECT_0] == st->event_wait_break) printf("[WAIT_Break:%lu]", nd->result);
+    else if (st->event_handles[nd->result - WAIT_OBJECT_0] == st->event_offsetstop) printf("[OFFSETSTOP:%lu]", nd->result);
+    else if (st->event_handles[nd->result - WAIT_OBJECT_0] == st->event_loop_point) printf("[LOOP_Point:%lu]", nd->result);
+    else printf("[USER_Event:%lu]", nd->result);
+    */
+    if (st->event_handles[nd->result - WAIT_OBJECT_0] == st->event_loop_point) notify_set_loop(st);
     else return NULL;
   }
 }
@@ -754,7 +759,6 @@ notify_wait_unblocking(void *data)
 static VALUE
 SoundBuffer_wait(int argc, VALUE *argv, VALUE self)
 {
-  DWORD result;
   struct NotifyData  data;
   struct SoundBuffer *st = get_st(self);
 
@@ -765,19 +769,18 @@ SoundBuffer_wait(int argc, VALUE *argv, VALUE self)
   data.timeout = argc ? NUM2UINT(argv[0]) : INFINITE;
   while (1) {
     rb_thread_call_without_gvl(notify_wait_blocking, (void*)(&data), notify_wait_unblocking, (void*)(&data));
-    if (data.result - WAIT_OBJECT_0 != st->event_count - 1) break;
+    if (st->event_handles[data.result - WAIT_OBJECT_0] != st->event_wait_break) break;
   }
   if (data.result == WAIT_FAILED)  rb_raise(eSoundBufferError, "[BUG]WaitForMultipleObjects error in notify_wait_blocking C function");
   if (data.result == WAIT_TIMEOUT) return Qnil;
-  result = data.result - WAIT_OBJECT_0;
-  ResetEvent(st->event_handles[result]);
+  ResetEvent(st->event_handles[data.result - WAIT_OBJECT_0]);
   // OFFSETSTOP
-  if (result == st->event_count - 2) {
+  if (st->event_handles[data.result - WAIT_OBJECT_0] == st->event_offsetstop) {
     if (st->repeat_flag == 0 && get_play_position(st) == 0) SoundBuffer_stop(self);
     rb_raise(rb_eStopIteration, "OFFSETSTOP");
   }
   // User event
-  return UINT2NUM(result);
+  return UINT2NUM(data.result - WAIT_OBJECT_0);
 }
 
 static LPHANDLE
@@ -1915,7 +1918,7 @@ Init_SoundBuffer(void)
   rb_define_method(cSoundBuffer, "avg_bytes_per_sec", SoundBuffer_get_avg_bytes_per_sec, 0);
 
   rb_define_method(cSoundBuffer, "loop?",             SoundBuffer_get_loop,          0);
-  rb_define_method(cSoundBuffer, "loop=",             SoundBuffer_set_loop,          1);
+  rb_define_method(cSoundBuffer, "set_loop",          SoundBuffer_set_loop,          1);
   rb_define_method(cSoundBuffer, "loop_count",        SoundBuffer_get_loop_count,    0);
   rb_define_method(cSoundBuffer, "loop_count=",       SoundBuffer_set_loop_count,    1);
   rb_define_method(cSoundBuffer, "loop_counter",      SoundBuffer_get_loop_counter,  0);

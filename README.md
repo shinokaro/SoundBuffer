@@ -11,6 +11,7 @@ zlib/libpng License
 * soundbuffer.so: これ単独でSoundBufferクラスを提供する。
 * soundbuffer.rb: エフェクトを使うときに便利なStructや追加メソッドを提供する。
 * beep.rb: Beepモジュール。Beep音を手軽に鳴らすためのモジュール。
+* CCplayer.rb: 巻き戻し、早送り、ABリピートのあるWavファイルプレイヤー。（要DXRuby）
 
 上記ファイルのどれかをrequireする。
 ### Beepモジュールの例
@@ -48,7 +49,7 @@ play, repeat, pause, stop, playing?, repeating?, pausing?<br />
 size, write, write_sync, stop_and_play<br />
 get_volume, set_volume, get_pan, set_pan, get_frequency, set_frequency<br />
 volume, volume=, pan, pan=, frequency, frequency=<br />
-etc...
+to_s, etc...
 
 ## 今後の予定
 * 例外を適切なものにする（たとえばArgumentErrorを使用する）
@@ -56,8 +57,7 @@ etc...
 * テストコード
 
 ## 現在取り組んでいること
-* to_sメソッド。
-* waitスレッドを走らせないと区間ループが作動しない。背後で走らせる仕組み。
+* 例外メッセージの修正。
 
 ## 実装しないもの
 * readメソッド。DirectSoundの仕様によりバッファーの読み取りは禁止（アドレス不定）されている。ただし、代替としてto_sメソッドは準備中。
